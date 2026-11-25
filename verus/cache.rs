@@ -121,7 +121,7 @@ pub fn evict_one(total: u64, sizes: &mut Vec<u64>) -> (r: u64)
         total >= old(sizes)@[0],
     ensures
         r == total - old(sizes)@[0],
-        sizes@ == old(sizes)@.remove(0),
+        final(sizes)@ == old(sizes)@.remove(0),
 {
     let first = sizes[0];
     sizes.remove(0);

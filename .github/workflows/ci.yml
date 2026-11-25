@@ -80,9 +80,13 @@ jobs:
           rustup toolchain install "$TC" --profile minimal
       - name: Verify
         run: |
-          set -e
+          failed=""
           for f in verus/*.rs; do
             echo "::group::$f"
-            ./verus-x86-linux/verus "$f"
+            ./verus-x86-linux/verus "$f" || failed="$failed $f"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::verification failed:$failed"
+            exit 1
+          fi

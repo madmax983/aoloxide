@@ -52,7 +52,7 @@ pub fn put(keys: &mut Vec<u64>, key: u64) -> (r: usize)
     requires
         old(keys).len() < usize::MAX,
     ensures
-        keys@ == old(keys)@.push(key),
+        final(keys)@ == old(keys)@.push(key),
         r == old(keys).len(),
 {
     keys.push(key);
@@ -64,7 +64,7 @@ pub fn delete(keys: &mut Vec<u64>, index: usize)
     requires
         index < old(keys).len(),
     ensures
-        keys@ == old(keys)@.remove(index as int),
+        final(keys)@ == old(keys)@.remove(index as int),
 {
     keys.remove(index);
 }
