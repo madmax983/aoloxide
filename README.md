@@ -31,7 +31,8 @@ Phase 1 (this release) ports the server core and the most-used modules:
 | Tcl interp lifecycle (`init.tcl`, `ns_ictl`, `ns_eval`, traces) | ✅ |
 | ~170 `ns_*` commands (`ns_conn`, `ns_return*`, `ns_set`, `nsv_*`, `ns_cache`, `ns_job`, `ns_thread`, `ns_sched*`, `ns_http`, ...) | ✅ |
 | `nslog` (access log), `nsperm` (Basic auth & permissions), `nscgi` (CGI/1.1) | ✅ |
-| `nsssl` (TLS), `nszlib`, `nscp` (control port), `nsdb`, `nsproxy`, `nsext`/`nspd` | Phase 2 |
+| `nsssl` (TLS via rustls), `nszlib`, `nscp` (control port), `nsdb` (SQLite driver), `nsproxy` (worker processes) | ✅ (phase 2) |
+| `nsext`/`nspd` | Planned |
 
 See [docs/porting.md](docs/porting.md) for the C-to-Rust map, every
 intentional deviation, and the phase 2 plan.
@@ -56,7 +57,8 @@ flowchart LR
   that every `ns_*` command is written against.
 * **`ns-tcl`**: the Tcl 8.6 engine (FFI to libtcl).
 * **`nsd`**: the server core (`libnsd`).
-* **`nslog`, `nsperm`, `nscgi`**: modules.
+* **`nslog`, `nsperm`, `nscgi`, `nsssl`, `nszlib`, `nscp`, `nsdb`, `nsproxy`**: modules
+  (`nsproxy` also builds the `nsproxy` worker binary; install it next to `nsd`).
 * **`aoloxide`**: the `nsd` binary.
 
 Design decisions are recorded in [docs/adr](docs/adr).

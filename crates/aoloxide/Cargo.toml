@@ -22,7 +22,9 @@ nssl = { path = "../nsssl", package = "nsssl" }
 nszlib = { path = "../nszlib" }
 nscp = { path = "../nscp" }
 nsdb = { path = "../nsdb" }
+nsproxy = { path = "../nsproxy" }
 ns-tcl = { path = "../ns-tcl" }
+ns-script = { path = "../ns-script" }
 anyhow.workspace = true
 libc.workspace = true
 

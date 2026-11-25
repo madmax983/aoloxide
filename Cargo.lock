@@ -34,6 +34,7 @@ dependencies = [
  "anyhow",
  "libc",
  "ns-core",
+ "ns-script",
  "ns-tcl",
  "nscgi",
  "nscp",
@@ -41,6 +42,7 @@ dependencies = [
  "nsdb",
  "nslog",
  "nsperm",
+ "nsproxy",
  "nsssl",
  "nszlib",
  "rcgen",
@@ -477,6 +479,17 @@ version = "0.1.0"
 dependencies = [
  "ns-core",
  "ns-script",
+ "nsd",
+ "tempfile",
+]
+
+[[package]]
+name = "nsproxy"
+version = "0.1.0"
+dependencies = [
+ "ns-core",
+ "ns-script",
+ "ns-tcl",
  "nsd",
  "tempfile",
 ]

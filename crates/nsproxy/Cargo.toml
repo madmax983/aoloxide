@@ -1,0 +1,24 @@
+[package]
+name = "nsproxy"
+description = "AOLserver nsproxy module: evaluate Tcl in isolated worker processes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nsproxy"
+path = "src/bin/nsproxy.rs"
+
+[dependencies]
+nsd = { path = "../nsd" }
+ns-core = { path = "../ns-core" }
+ns-script = { path = "../ns-script" }
+ns-tcl = { path = "../ns-tcl" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

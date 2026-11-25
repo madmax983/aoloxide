@@ -44,6 +44,11 @@ intentional behavioural deviation, and tracks what is not yet ported.
 | `nslog/` | `crates/nslog` |
 | `nsperm/` | `crates/nsperm` |
 | `nscgi/` | `crates/nscgi` |
+| `nsssl/` (and `nsopenssl`) | `crates/nsssl` (rustls `StreamWrapper` over the socket driver) |
+| `nszlib/` | `crates/nszlib` |
+| `nscp/` | `crates/nscp` |
+| `nsdb/` | `crates/nsdb` (`driver.rs`: driver trait + SQLite) |
+| `nsproxy/nsproxylib.c`, `nsproxy.c` | `crates/nsproxy` (`src/bin/nsproxy.rs` is the worker) |
 | `nsd/dstring.c`, `index.c`, `lisp.c`, `str.c`, `dsprintf.c`, `fd.c`, `binder.c` | replaced by the Rust standard library |
 
 ## Intentional deviations
@@ -92,6 +97,23 @@ Script API:
 14. `ns_thread name` reports but cannot rename the current thread.
 15. `ns_http`/`ns_geturl` support plain `http://` only.
 
+Modules:
+
+16. `nsssl` is built on rustls and answers to both `nsssl` and
+    `nsopenssl` module names; it accepts PEM `certfile`/`keyfile` only (no
+    OpenSSL cipher strings or client-certificate options).
+17. `nsdb` ships a SQLite driver (`sqlite`) in place of AOLserver's
+    external C drivers.  Drivers buffer a query's rows when it runs;
+    `ns_db sp_*` (stored procedures) return a "not supported" error.
+18. `ns_proxy active pool` lists checked-out handles that are evaluating.
+    AOLserver walked the pool's *free* list, so it always returned an
+    empty list.
+19. `nsproxy` workers speak a private length-prefixed protocol (the worker
+    binary ships with the server).  Replies are read whole by a reader
+    thread, so `-sendtimeout` and `-recvtimeout` are accepted and reported
+    but have no effect; `-evaltimeout` and `-waittimeout` behave as in
+    AOLserver.
+
 ## Not yet supported (phase 2)
 
 These commands exist but return a clear `not supported` error:
@@ -105,12 +127,7 @@ Modules still to port:
 
 | Module | Plan |
 |---|---|
-| `nsssl` | TLS driver via `rustls`, as a `StreamWrapper` (ADR 0003) |
-| `nszlib` | `ns_zlib` commands via `flate2` |
-| `nscp` | control port: telnet-style admin shell over a driver |
-| `nsdb` | `ns_db` pools and handles, driver trait, a SQLite driver |
-| `nsproxy` | `ns_proxy` worker processes |
-| `nsext`, `nspd` | external database proxy protocol |
+| `nsext`, `nspd` | external database proxy protocol, as an `nsdb` driver |
 
 Also planned: spooling large uploads to temp files, `ns_sockcallback` on
 the tokio runtime, and channel transfer for `ns_chan`.
@@ -125,6 +142,7 @@ the tokio runtime, and channel transfer for `ns_chan`.
 | `glob.rs` | an executable `*`/`?` matcher equals the recursive spec; literal and `*` lemmas |
 | `pool.rs` | pool transitions keep `idle ≤ current ≤ max`; enqueue never strands work while there is capacity |
 | `cache.rs` | inserts keep total size ≤ max; eviction removes only LRU entries |
+| `proxy.rs` | nsproxy handle accounting (`avail + out = max`, idle workers ≤ spare capacity, failed `get` restores the pool) and the `Idle → Busy → Done → Idle` proxy state machine |
 
 The production implementations are additionally checked against the same
 specifications by property tests (`proptest`).
