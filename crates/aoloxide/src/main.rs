@@ -86,7 +86,12 @@ fn run() -> Result<()> {
     opts.log_stderr = args.foreground;
     opts.modules = aoloxide::modules();
     if args.check {
-        nsd::eval_config(&ns_tcl::TclEngine::new(), &opts.config_text, &opts.args)?;
+        nsd::eval_config(
+            &ns_tcl::TclEngine::new(),
+            &opts.config_text,
+            &opts.args,
+            opts.config_file.as_deref(),
+        )?;
         println!("config ok: {}", config.display());
         return Ok(());
     }

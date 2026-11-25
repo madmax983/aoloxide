@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y tcl8.6-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y tcl8.6-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  coverage:
+    name: coverage (>= 85% lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y tcl8.6-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 85
+
+  verus:
+    name: verus proofs
+    runs-on: ubuntu-latest
+    env:
+      # Pinned rolling release; bump deliberately.
+      VERUS_RELEASE: 0.2026.11.25.48ed2e8
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Verus
+        run: |
+          curl -sSfL -o verus.zip \
+            "https://github.com/verus-lang/verus/releases/download/release%2Frolling%2F${VERUS_RELEASE}/verus-${VERUS_RELEASE}-x86-linux.zip"
+          unzip -q verus.zip
+          cat verus-x86-linux/version.json
+      - name: Install the Rust toolchain Verus was built against
+        run: |
+          TC=$(grep -o '"toolchain": *"[^ "]*' verus-x86-linux/version.json | sed 's/.*"//')
+          echo "toolchain: $TC"
+          rustup toolchain install "$TC" --profile minimal
+      - name: Verify
+        run: |
+          set -e
+          for f in verus/*.rs; do
+            echo "::group::$f"
+            ./verus-x86-linux/verus "$f"
+            echo "::endgroup::"
+          done

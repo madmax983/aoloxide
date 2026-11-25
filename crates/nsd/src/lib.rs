@@ -187,10 +187,13 @@ impl std::fmt::Debug for Nsd {
 }
 
 /// Evaluate a config script into a [`Config`] (`NsConfigEval`).
+///
+/// `config_file` is reported by `ns_info config` while the script runs.
 pub fn eval_config(
     engine: &dyn ScriptEngine,
     text: &str,
     args: &[String],
+    config_file: Option<&Path>,
 ) -> Result<Config, NsError> {
     let interp = engine.create_interp()?;
     let state = Arc::new(Mutex::new((Config::new(), None::<usize>)));
@@ -244,6 +247,9 @@ pub fn eval_config(
             "localhost".into()
         }
     };
+    let cfg_path = config_file
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     interp.register(
         "ns_info",
         command(move |_, argv| {
@@ -253,6 +259,7 @@ pub fn eval_config(
                 .ok_or_else(|| wrong_args(argv, 1, "option"))?;
             Ok(match opt {
                 "hostname" => hostname.clone(),
+                "config" => cfg_path.clone(),
                 "address" => "127.0.0.1".into(),
                 "name" => global::SERVER_NAME.into(),
                 "version" | "patchlevel" => global::SERVER_VERSION.into(),
@@ -350,7 +357,12 @@ impl Nsd {
         let engine: Arc<dyn ScriptEngine> = opts
             .engine
             .unwrap_or_else(|| Arc::new(ns_tcl::TclEngine::new()));
-        let config = eval_config(&*engine, &opts.config_text, &opts.args)?;
+        let config = eval_config(
+            &*engine,
+            &opts.config_text,
+            &opts.args,
+            opts.config_file.as_deref(),
+        )?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("-driver-")
@@ -558,15 +570,24 @@ mod tests {
             &e,
             "ns_section ns/parameters\nns_param home /tmp\nns_param debug [expr {1+1}]\nset x [ns_info name]\nns_section ns/servers\nns_param s1 {Server One}\nns_param argc $argc",
             &["a".into()],
+            None,
         )
         .expect("config");
         assert_eq!(c.get("ns/parameters", "home"), Some("/tmp"));
         assert_eq!(c.get("ns/parameters", "debug"), Some("2"));
         assert_eq!(c.get("ns/servers", "s1"), Some("Server One"));
         assert_eq!(c.get("ns/servers", "argc"), Some("1"));
-        assert!(eval_config(&e, "ns_param a b", &[]).is_err());
-        assert!(eval_config(&e, "ns_section", &[]).is_err());
-        assert!(eval_config(&e, "error boom", &[]).is_err());
+        assert!(eval_config(&e, "ns_param a b", &[], None).is_err());
+        assert!(eval_config(&e, "ns_section", &[], None).is_err());
+        assert!(eval_config(&e, "error boom", &[], None).is_err());
+        let c = eval_config(
+            &e,
+            "ns_section x\nns_param c [ns_info config]",
+            &[],
+            Some(Path::new("/etc/nsd.tcl")),
+        )
+        .expect("cfg");
+        assert_eq!(c.get("x", "c"), Some("/etc/nsd.tcl"));
     }
 
     #[test]

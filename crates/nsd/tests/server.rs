@@ -109,6 +109,13 @@ proc internal_proc {} { ns_internalredirect /hello }
     });
     let r = srv.get("/hello?name=Mark");
     assert_eq!(r.status, 200, "{r:?} {:?}", srv.log());
+    // Applying the saved init script to a fresh conn interp must be clean.
+    let errors: Vec<String> = srv
+        .log()
+        .into_iter()
+        .filter(|l| l.contains("Error:"))
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(r.body, "hello Mark from /hello via GET");
 
     let body = "a=1&b=two+words";

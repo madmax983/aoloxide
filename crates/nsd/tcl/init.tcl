@@ -428,6 +428,12 @@ proc _ns_getnamespaces {listVar {top "::"}} {
     upvar $listVar list
     lappend list $top
     foreach c [namespace children $top] {
+        # aoloxide: TclOO's namespaces are built into every Tcl 8.6 interp
+        # and cannot be recreated from script; saving them makes every new
+        # interp fail in "ns_ictl update".
+        if {[string match ::oo* $c]} {
+            continue
+        }
         _ns_getnamespaces list $c
     }
 }
