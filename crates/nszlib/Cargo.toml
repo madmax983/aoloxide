@@ -1,0 +1,20 @@
+[package]
+name = "nszlib"
+description = "AOLserver nszlib module: ns_zlib compression commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nsd = { path = "../nsd" }
+ns-core = { path = "../ns-core" }
+ns-script = { path = "../ns-script" }
+flate2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

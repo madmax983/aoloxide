@@ -1,0 +1,23 @@
+[package]
+name = "nsssl"
+description = "AOLserver nsssl module: HTTPS driver on rustls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nsd = { path = "../nsd" }
+ns-core = { path = "../ns-core" }
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rcgen = "0.13"
+
+[lints]
+workspace = true

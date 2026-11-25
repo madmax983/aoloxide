@@ -10,12 +10,16 @@ use std::sync::Arc;
 use nsd::ModuleRegistry;
 
 /// All modules shipped with aoloxide, keyed by the names used in
-/// `ns/server/S/modules` (`nssock`, `nslog`, `nsperm`, `nscgi`).
+/// `ns/server/S/modules` (`nssock`, `nslog`, `nsperm`, `nscgi`, `nsssl`,
+/// `nszlib`).
 pub fn modules() -> ModuleRegistry {
     let mut r = nsd::builtin_modules();
     r.register("nslog", Arc::new(nslog::init));
     r.register("nsperm", Arc::new(nsperm::init));
     r.register("nscgi", Arc::new(nscgi::init));
+    r.register("nsssl", Arc::new(nssl::init));
+    r.register("nsopenssl", Arc::new(nssl::init));
+    r.register("nszlib", Arc::new(nszlib::init));
     r
 }
 
@@ -173,7 +177,7 @@ mod tests {
     #[test]
     fn modules_and_home() {
         let m = modules();
-        for n in ["nssock", "nslog", "nsperm", "nscgi"] {
+        for n in ["nssock", "nslog", "nsperm", "nscgi", "nsssl", "nszlib"] {
             assert!(m.get(n).is_some(), "{n}");
         }
         let d = tempfile::tempdir().expect("tmp");

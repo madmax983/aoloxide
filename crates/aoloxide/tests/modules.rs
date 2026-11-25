@@ -245,3 +245,86 @@ fn nsd_binary_runs_and_stops_on_sigterm() {
         "pid file removed at exit"
     );
 }
+
+#[test]
+fn nsssl_serves_https() {
+    use std::sync::Arc;
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, ck.cert.pem()).unwrap();
+    std::fs::write(&key, ck.key_pair.serialize_pem()).unwrap();
+    let extra = format!(
+        "ns_section ns/server/s1/module/nsssl\nns_param certfile {}\nns_param keyfile {}\nns_param port 0\nns_param address 127.0.0.1\nns_param hostname localhost",
+        cert.display(),
+        key.display()
+    );
+    let srv = boot("ns_param nsssl nsssl.so", &extra, |h| {
+        std::fs::write(h.join("servers/s1/pages/s.txt"), "secure").unwrap();
+    });
+    let drivers = srv.nsd.drivers();
+    let tls = drivers
+        .iter()
+        .find(|d| d.info.protocol == "https")
+        .expect("https driver");
+    assert!(tls.info.location().starts_with("https://localhost:"));
+    let port = tls.info.port();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ck.cert.der().clone()).unwrap();
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let body = rt.block_on(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let conn = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut s = conn.connect(name, tcp).await.unwrap();
+        s.write_all(b"GET /s.txt HTTP/1.0\r\n\r\n").await.unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out).await;
+        String::from_utf8_lossy(&out).into_owned()
+    });
+    assert!(body.starts_with("HTTP/1.0 200 OK"), "{body}");
+    assert!(body.ends_with("secure"));
+}
+
+#[test]
+fn nsssl_without_cert_is_skipped() {
+    let srv = boot("ns_param nsssl nsssl.so", "", |_| {});
+    assert_eq!(srv.nsd.drivers().len(), 1, "only nssock");
+    assert!(srv
+        .nsd
+        .global
+        .log
+        .captured()
+        .iter()
+        .any(|l| l.contains("certfile not specified")));
+}
+
+#[test]
+fn nszlib_command() {
+    let srv = boot("ns_param nszlib nszlib.so", "", |h| {
+        let lib = h.join("servers/s1/modules/tcl");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            lib.join("z.tcl"),
+            "ns_register_proc GET /z z_proc\nproc z_proc {} { ns_return 200 text/plain [ns_zlib uncompress [ns_zlib compress roundtrip]] }\n",
+        )
+        .unwrap();
+    });
+    let r = request(srv.port, "GET /z HTTP/1.0\r\n\r\n");
+    assert!(r.ends_with("roundtrip"), "{r}");
+}
