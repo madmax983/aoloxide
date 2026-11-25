@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y tcl8.6-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y tcl8.6-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  coverage:
+    name: coverage (>= 85% lines)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y tcl8.6-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --summary-only --fail-under-lines 85
+
+  verus:
+    name: verus proofs
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the latest Verus release
+        # Verus publishes "rolling" releases and deletes old ones, so a
+        # pinned URL goes stale; resolve the newest x86-linux asset instead.
+        run: |
+          url=$(gh api 'repos/verus-lang/verus/releases?per_page=10' \
+            --jq '[.[].assets[] | select(.name | endswith("x86-linux.zip"))][0].browser_download_url')
+          echo "Verus asset: $url"
+          curl -sSfL -o verus.zip "$url"
+          unzip -q verus.zip
+          cat verus-x86-linux/version.json
+      - name: Install the Rust toolchain Verus was built against
+        run: |
+          TC=$(grep -o '"toolchain": *"[^ "]*' verus-x86-linux/version.json | sed 's/.*"//')
+          echo "toolchain: $TC"
+          rustup toolchain install "$TC" --profile minimal
+      - name: Verify
+        run: |
+          failed=""
+          for f in verus/*.rs; do
+            echo "::group::$f"
+            ./verus-x86-linux/verus "$f" || failed="$failed $f"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::verification failed:$failed"
+            exit 1
+          fi

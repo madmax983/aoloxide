@@ -1,0 +1,25 @@
+[package]
+name = "nsd"
+description = "The AOLserver server core (libnsd) ported to Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ns-core = { path = "../ns-core" }
+ns-script = { path = "../ns-script" }
+ns-tcl = { path = "../ns-tcl" }
+thiserror.workspace = true
+tokio.workspace = true
+libc.workspace = true
+flate2.workspace = true
+encoding_rs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
