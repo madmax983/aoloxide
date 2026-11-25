@@ -93,8 +93,7 @@ callbacks and rolls the server log.
 ## License
 
 AOLserver is distributed under the AOLserver Public License (MPL 1.1) or the
-GPL; see [LICENSE-AOLSERVER](LICENSE-AOLSERVER).  This port is a derivative
-work of AOLserver, and the bundled Tcl library files are AOLserver's own, so
-the workspace is declared `MPL-1.1 OR GPL-2.0-or-later`.  The repository's
-original `LICENSE` file (Apache-2.0) predates the port; see
-[docs/porting.md#licensing](docs/porting.md#licensing).
+GPL.  This port is a derivative work of AOLserver, and the bundled Tcl
+library files are AOLserver's own, so it is distributed under the same terms:
+see [LICENSE](LICENSE).  The workspace is declared
+`MPL-1.1 OR GPL-2.0-or-later`.

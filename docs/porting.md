@@ -150,10 +150,8 @@ specifications by property tests (`proptest`).
 ## Licensing
 
 AOLserver is available under the AOLserver Public License 1.1 (a Mozilla
-Public License 1.1 derivative) or the GPL ([LICENSE-AOLSERVER](../LICENSE-AOLSERVER)).
+Public License 1.1 derivative) or the GPL.
 A translation of its source is a derivative work, and the Tcl library files
-shipped in `crates/*/tcl/` are AOLserver's own.  The workspace is therefore
-declared `MPL-1.1 OR GPL-2.0-or-later`.  The repository was created with an
-Apache-2.0 `LICENSE` file, which predates the port.  The owner should decide
-whether to replace it (Apache-2.0 alone is not compatible with MPL 1.1's
-file-level copyleft for the derived files).
+shipped in `crates/*/tcl/` are AOLserver's own, so aoloxide is distributed
+under AOLserver's own terms ([LICENSE](../LICENSE)).  The workspace is
+declared `MPL-1.1 OR GPL-2.0-or-later`.
