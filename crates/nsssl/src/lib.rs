@@ -10,11 +10,15 @@
 //! parameter.  As in AOLserver, a missing `certfile` logs a warning and the
 //! driver is not started.  The default port is 443 and locations use
 //! `https://`.
+//!
+//! As `NsSSLInitialize` does, a per-server load adds `ssl_info` to the
+//! server's interps (even without a certificate).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ns_core::log::Severity;
+use ns_script::command;
 use nsd::driver::{ConnStream, StreamWrapper, WrapFuture};
 use nsd::{ModuleContext, NsError};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -96,8 +100,17 @@ fn resolve(ctx: &ModuleContext<'_>, p: &str) -> PathBuf {
     }
 }
 
-/// Module init.
+/// `ssl_info` (`InfoCmd` in `ssltcl.c`): `{SSL_EXPORT} {SSL_PROTOCOL_VERSION} `.
+/// AOLserver's non-export build reports `{0} {2} `; the constants are
+/// reproduced verbatim, whatever TLS version rustls negotiates.  Arguments
+/// are ignored, as in C.
+pub const SSL_INFO: &str = "{0} {2} ";
+
+/// Module init (`Ns_ModuleInit` in `nsssl.c`).
 pub fn init(ctx: &ModuleContext<'_>) -> Result<(), NsError> {
+    if let Some(server) = ctx.server {
+        server.add_command("ssl_info", command(|_, _| Ok(SSL_INFO.to_owned())));
+    }
     let path = ctx.config_path();
     let c = &ctx.global.config;
     let Some(cert) = c.get(&path, "certfile") else {
@@ -110,7 +123,7 @@ pub fn init(ctx: &ModuleContext<'_>) -> Result<(), NsError> {
     let cert = resolve(ctx, cert);
     let key = resolve(ctx, c.get(&path, "keyfile").unwrap_or("keyfile.pem"));
     let w = wrapper(&cert, &key)?;
-    nsd::driver_init(ctx, true, Arc::new(w))
+    nsd::driver_init(ctx, "nsssl", true, Arc::new(w))
 }
 
 #[cfg(test)]

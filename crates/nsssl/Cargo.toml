@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 nsd = { path = "../nsd" }
 ns-core = { path = "../ns-core" }
+ns-script = { path = "../ns-script" }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio-rustls.workspace = true

@@ -440,7 +440,6 @@ name = "nsd"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
- "flate2",
  "libc",
  "ns-core",
  "ns-script",
@@ -499,6 +498,7 @@ name = "nsssl"
 version = "0.1.0"
 dependencies = [
  "ns-core",
+ "ns-script",
  "nsd",
  "rcgen",
  "rustls",

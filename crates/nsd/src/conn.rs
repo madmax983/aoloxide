@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use encoding_rs::Encoding;
 use ns_core::form::Form;
@@ -536,17 +536,7 @@ impl ConnCtx {
             let runtime = self.server.global.runtime.clone();
             let mut sock = self.conn_mut().sock.take();
             let result = if let Some(s) = sock.as_mut() {
-                runtime.block_on(async {
-                    match tokio::time::timeout(sendwait, async {
-                        s.stream.write_all(&out).await?;
-                        s.stream.flush().await
-                    })
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "send timeout")),
-                    }
-                })
+                send_bounded(&runtime, s, &out, sendwait)
             } else {
                 Ok(())
             };
@@ -601,7 +591,7 @@ impl ConnCtx {
                 .header("accept-encoding")
                 .is_some_and(|a| a.contains("gzip"));
         if gzip_ok {
-            if let Ok(z) = gzip(&buf, self.server.opts.gzip_level) {
+            if let Ok(z) = self.server.global.gzip(&buf, self.server.opts.gzip_level) {
                 buf = z;
                 self.cond_set_header("Content-Encoding", "gzip");
             }
@@ -668,11 +658,18 @@ impl ConnCtx {
             c.sock.take()
         };
         if let Some(mut s) = sock {
-            // Flush any queued-but-unsent headers (e.g. after ns_headers).
-            let pending = std::mem::take(&mut self.conn_mut().obuf);
+            // Flush any queued-but-unsent headers, bounded by sendwait like
+            // every other write (Ns_SockSend); a failed write drops
+            // keep-alive.
+            let (pending, sendwait) = {
+                let mut c = self.conn_mut();
+                (std::mem::take(&mut c.obuf), c.driver.sendwait)
+            };
             if !pending.is_empty() {
                 let rt = self.server.global.runtime.clone();
-                let _ = rt.block_on(async { s.stream.write_all(&pending).await });
+                if send_bounded(&rt, &mut s, &pending, sendwait).is_err() {
+                    self.conn_mut().flags.keepalive = false;
+                }
             }
             let keep = self.conn().flags.keepalive;
             s.release(keep);
@@ -1066,17 +1063,25 @@ impl ConnCtx {
     }
 }
 
-/// Gzip `data` at `level` (`Ns_Gzip`).
-pub fn gzip(data: &[u8], level: u32) -> io::Result<Vec<u8>> {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-    let mut e = GzEncoder::new(
-        Vec::with_capacity(data.len() / 2),
-        Compression::new(level.min(9)),
-    );
-    e.write_all(data)?;
-    e.finish()
+/// Write and flush `data` to the client within `sendwait` (`Ns_SockSend`
+/// with the driver's send timeout).
+fn send_bounded(
+    runtime: &tokio::runtime::Handle,
+    sock: &mut Sock,
+    data: &[u8],
+    sendwait: Duration,
+) -> io::Result<()> {
+    runtime.block_on(async {
+        match tokio::time::timeout(sendwait, async {
+            sock.stream.write_all(data).await?;
+            sock.stream.flush().await
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "send timeout")),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1088,18 +1093,6 @@ mod tests {
         assert_eq!(reason(200), "OK");
         assert_eq!(reason(404), "Not Found");
         assert_eq!(reason(999), "Unknown Reason");
-    }
-
-    #[test]
-    fn gzip_roundtrip() {
-        use flate2::read::GzDecoder;
-        let data = b"hello hello hello hello".repeat(10);
-        let z = gzip(&data, 4).expect("gzip");
-        let mut out = Vec::new();
-        GzDecoder::new(&z[..])
-            .read_to_end(&mut out)
-            .expect("gunzip");
-        assert_eq!(out, data);
     }
 
     #[test]
