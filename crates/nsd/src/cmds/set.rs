@@ -4,6 +4,7 @@
 //! `d` dynamic private, `t` static private (e.g. connection headers),
 //! `s` shared dynamic, `p` shared static.
 
+use std::collections::HashMap;
 use std::sync::{Arc, PoisonError};
 
 use ns_core::request::{parse_header, HeaderCase};
@@ -12,7 +13,7 @@ use ns_script::{wrong_args, Command, Exception, Interp, ScriptResult};
 
 use super::{cmd, int_arg, server};
 use crate::conn::{lock_set, set_ref, SetRef};
-use crate::interp::ns_interp;
+use crate::interp::{ns_interp, BareSetsRef};
 
 /// Commands defined here.
 pub fn commands() -> Vec<(&'static str, Command)> {
@@ -22,6 +23,23 @@ pub fn commands() -> Vec<(&'static str, Command)> {
     ]
 }
 
+/// Run `f` on the interp's private set table and next-id counter: the
+/// server interp's, or a bare interp's ([`crate::interp::init_bare`]).
+fn with_private<R>(
+    interp: &dyn Interp,
+    f: impl FnOnce(&mut HashMap<String, SetRef>, &mut u64) -> R,
+) -> Result<R, Exception> {
+    if let Some(b) = interp.ext().get::<BareSetsRef>() {
+        let mut b = b.borrow_mut();
+        let b = &mut *b;
+        return Ok(f(&mut b.sets, &mut b.next_set));
+    }
+    let st = ns_interp(interp)?;
+    let mut s = st.borrow_mut();
+    let s = &mut *s;
+    Ok(f(&mut s.sets, &mut s.next_set))
+}
+
 /// Enter `set` into the interp and return its id (`Ns_TclEnterSet`).
 pub fn enter_set(
     interp: &dyn Interp,
@@ -29,7 +47,6 @@ pub fn enter_set(
     dynamic: bool,
     shared: bool,
 ) -> Result<String, Exception> {
-    let st = ns_interp(interp)?;
     if shared {
         let srv = server(interp)?;
         let kind = if dynamic { 's' } else { 'p' };
@@ -46,15 +63,14 @@ pub fn enter_set(
         }
     }
     let kind = if dynamic { 'd' } else { 't' };
-    let mut s = st.borrow_mut();
-    loop {
-        let id = format!("{kind}{}", s.next_set);
-        s.next_set += 1;
-        if !s.sets.contains_key(&id) {
-            s.sets.insert(id.clone(), set);
-            return Ok(id);
+    with_private(interp, |sets, next| loop {
+        let id = format!("{kind}{next}");
+        *next += 1;
+        if !sets.contains_key(&id) {
+            sets.insert(id.clone(), set);
+            return id;
         }
-    }
+    })
 }
 
 fn is_shared(id: &str) -> bool {
@@ -75,22 +91,20 @@ pub fn lookup_set(interp: &dyn Interp, id: &str, remove: bool) -> Result<SetRef,
             t.get(id).cloned()
         }
     } else {
-        let st = ns_interp(interp)?;
-        let mut s = st.borrow_mut();
-        if remove {
-            s.sets.remove(id)
-        } else {
-            s.sets.get(id).cloned()
-        }
+        with_private(interp, |sets, _| {
+            if remove {
+                sets.remove(id)
+            } else {
+                sets.get(id).cloned()
+            }
+        })?
     };
     found.ok_or_else(|| Exception::error(format!("no such set: {id}")))
 }
 
 /// Remove all private dynamic sets (`ns_set cleanup`).
 pub fn cleanup_sets(interp: &dyn Interp) -> Result<(), Exception> {
-    let st = ns_interp(interp)?;
-    st.borrow_mut().sets.clear();
-    Ok(())
+    with_private(interp, |sets, _| sets.clear())
 }
 
 const OPTS: &[&str] = &[
@@ -110,7 +124,7 @@ fn ns_set(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         }
         "list" => {
             let ids: Vec<String> = match argv.get(2).map(String::as_str) {
-                None => ns_interp(interp)?.borrow().sets.keys().cloned().collect(),
+                None => with_private(interp, |sets, _| sets.keys().cloned().collect())?,
                 Some("-shared") => server(interp)?
                     .shared_sets
                     .lock()

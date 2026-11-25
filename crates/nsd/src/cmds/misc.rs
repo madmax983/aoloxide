@@ -101,7 +101,13 @@ fn ns_log(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         ))
     })?;
     let msg = argv[2..].join(" ");
-    server(interp)?.global.log(sev, &msg);
+    if let Ok(s) = server(interp) {
+        s.global.log(sev, &msg);
+    } else {
+        // No server (an `nsproxy` worker): `Ns_Log` writes to stderr.
+        static LOG: OnceLock<ns_core::log::Log> = OnceLock::new();
+        LOG.get_or_init(ns_core::log::Log::stderr).log(sev, &msg);
+    }
     Ok(String::new())
 }
 

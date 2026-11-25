@@ -487,6 +487,7 @@ dependencies = [
 name = "nsproxy"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ns-core",
  "ns-script",
  "ns-tcl",
