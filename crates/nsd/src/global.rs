@@ -203,7 +203,13 @@ pub struct Global {
     pub wrappers: crate::driver::WrapperRegistry,
     /// Process-wide `ns_share`/`ns_var`-style misc storage.
     pub env_lock: Mutex<()>,
+    /// Compression procedure installed by nszlib (`Ns_SetGzipProc`).
+    gzip_proc: RwLock<Option<GzipProc>>,
 }
+
+/// A gzip compression procedure (`Ns_GzipProc`): compress `data` at
+/// `level` into a complete gzip stream.
+pub type GzipProc = fn(data: &[u8], level: u32) -> std::io::Result<Vec<u8>>;
 
 impl std::fmt::Debug for Global {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -328,9 +334,35 @@ impl Global {
             drivers: RwLock::new(Vec::new()),
             wrappers: crate::driver::WrapperRegistry::default(),
             env_lock: Mutex::new(()),
+            gzip_proc: RwLock::new(None),
         });
         g.pools.limits_or_create("default");
         Ok(g)
+    }
+
+    /// Install the gzip procedure used for response compression
+    /// (`Ns_SetGzipProc`, called by nszlib).
+    pub fn set_gzip_proc(&self, proc_: GzipProc) {
+        *self
+            .gzip_proc
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(proc_);
+    }
+
+    /// Compress with the installed gzip procedure (`Ns_Gzip`).  Fails when
+    /// no procedure is installed, i.e. nszlib is not loaded.
+    pub fn gzip(&self, data: &[u8], level: u32) -> std::io::Result<Vec<u8>> {
+        let proc_ = *self
+            .gzip_proc
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        match proc_ {
+            Some(p) => p(data, level),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no gzip procedure installed",
+            )),
+        }
     }
 
     /// Write to the server log (`Ns_Log`).

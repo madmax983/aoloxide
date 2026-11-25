@@ -449,8 +449,17 @@ async fn write_error(stream: &mut Box<dyn ConnStream>, status: u16) {
     let _ = tokio::time::timeout(Duration::from_secs(5), stream.write_all(msg.as_bytes())).await;
 }
 
-async fn graceful_close(mut stream: Box<dyn ConnStream>, closewait: Duration) {
-    let _ = stream.shutdown().await;
+/// Close `stream`: flush and shut down the write side (bounded by
+/// `sendwait`, as `DriverClose`/`NsSSLFlush` are bounded by the socket send
+/// timeout), then drain input for up to `closewait`.  A peer that stops
+/// reading cannot hold the task (and its `maxsock` permit) forever.
+async fn graceful_close(mut stream: Box<dyn ConnStream>, sendwait: Duration, closewait: Duration) {
+    if tokio::time::timeout(sendwait, stream.shutdown())
+        .await
+        .is_err()
+    {
+        return;
+    }
     if closewait.is_zero() {
         return;
     }
@@ -598,7 +607,7 @@ impl Driver {
                         self.info.stats.overflow.fetch_add(1, Ordering::Relaxed);
                     }
                     write_error(&mut stream, code).await;
-                    graceful_close(stream, self.info.closewait).await;
+                    graceful_close(stream, self.info.sendwait, self.info.closewait).await;
                     return;
                 }
                 Err(ReadError::Timeout) => {
@@ -635,7 +644,7 @@ impl Driver {
             stream = ret.stream;
             buf = ret.leftover;
             if !ret.keep || *stop.borrow() {
-                graceful_close(stream, self.info.closewait).await;
+                graceful_close(stream, self.info.sendwait, self.info.closewait).await;
                 return;
             }
         }
@@ -817,6 +826,57 @@ mod tests {
         let (r, _) = rt().block_on(parse(b"GET /old\r\n", &i)).expect("read");
         assert_eq!(r.request.major, 0);
         assert_eq!(r.headers.len(), 0);
+    }
+
+    /// A stream whose peer never reads: writes and shutdown stay pending.
+    struct Stuck;
+
+    impl AsyncRead for Stuck {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for Stuck {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[test]
+    fn graceful_close_is_bounded_by_sendwait() {
+        let done = rt().block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                graceful_close(
+                    Box::new(Stuck),
+                    Duration::from_millis(100),
+                    Duration::from_millis(100),
+                ),
+            )
+            .await
+        });
+        assert!(done.is_ok(), "graceful_close hung on a stuck shutdown");
     }
 
     #[test]

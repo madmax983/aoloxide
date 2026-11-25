@@ -130,6 +130,15 @@ nscp:
     line is read up to `\n` (CR and NUL bytes are dropped), so several
     lines arriving in one packet are evaluated one command at a time.
 
+nszlib:
+
+20 (core-ssl-zlib). `ns_zlib uncompress` and `gunzip` decode their result
+    as Tcl 8.6 reads bytes: valid UTF-8 is decoded, `C0 80` is NUL and any
+    other invalid byte is its Latin-1 character.  Tcl also decodes
+    UTF-8-encoded surrogates (`ED A0 80`) to lone UTF-16 surrogates; script
+    strings here cannot hold those, so each such byte is its Latin-1
+    character instead.
+
 ## Not yet supported (phase 2)
 
 These commands exist but return a clear `not supported` error:

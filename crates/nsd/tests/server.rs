@@ -215,3 +215,149 @@ fn chunked_streaming_output() {
     assert!(raw.contains("3\r\none\r\n"));
     assert!(raw.ends_with("0\r\n\r\n"));
 }
+
+const GZIP_PROC: &str = r"
+ns_register_proc GET /big big_proc
+proc big_proc {} {
+    ns_conn gzip 1
+    ns_return 200 text/plain [string repeat x 10000]
+}
+";
+
+fn gzip_server(modules: nsd::ModuleRegistry) -> TestServer {
+    TestServer::start_with(
+        "",
+        |home| {
+            let lib = home.join("servers/s1/modules/tcl");
+            std::fs::create_dir_all(&lib).unwrap();
+            std::fs::write(lib.join("big.tcl"), GZIP_PROC).unwrap();
+        },
+        modules,
+    )
+}
+
+#[test]
+fn no_gzip_without_gzip_proc() {
+    // Ns_Gzip fails unless a module (nszlib) installed Ns_SetGzipProc.
+    let srv = gzip_server(nsd::builtin_modules());
+    let r = Response::parse(&srv.raw("GET /big HTTP/1.0\r\nAccept-Encoding: gzip\r\n\r\n"));
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-encoding"), None, "{r:?}");
+    assert_eq!(r.body.len(), 10000);
+}
+
+#[test]
+fn gzip_uses_installed_proc() {
+    fn fake(data: &[u8], level: u32) -> std::io::Result<Vec<u8>> {
+        Ok(format!("Z{level}:{}", data.len()).into_bytes())
+    }
+    let mut modules = nsd::builtin_modules();
+    modules.register(
+        "fakezlib",
+        std::sync::Arc::new(|ctx: &nsd::ModuleContext<'_>| {
+            ctx.global.set_gzip_proc(fake);
+            Ok(())
+        }),
+    );
+    let srv = TestServer::start_with(
+        "ns_section ns/server/s1/modules\nns_param fakezlib fakezlib.so",
+        |home| {
+            let lib = home.join("servers/s1/modules/tcl");
+            std::fs::create_dir_all(&lib).unwrap();
+            std::fs::write(lib.join("big.tcl"), GZIP_PROC).unwrap();
+        },
+        modules,
+    );
+    let r = Response::parse(&srv.raw("GET /big HTTP/1.0\r\nAccept-Encoding: gzip\r\n\r\n"));
+    assert_eq!(r.header("content-encoding"), Some("gzip"), "{r:?}");
+    assert_eq!(r.body, "Z4:10000");
+    let r = srv.get("/big");
+    assert_eq!(r.header("content-encoding"), None, "no Accept-Encoding");
+}
+
+#[test]
+fn close_bounds_queued_header_write_by_sendwait() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let closed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&closed);
+    let mut modules = nsd::builtin_modules();
+    modules.register(
+        "qh",
+        Arc::new(move |ctx: &nsd::ModuleContext<'_>| {
+            let flag = Arc::clone(&flag);
+            if let Some(server) = ctx.server {
+                nsd::op::register_request(
+                    server,
+                    "GET",
+                    "/qh",
+                    nsd::op::RequestEntry {
+                        proc_: Arc::new(move |conn| {
+                            // Headers far larger than the socket buffers,
+                            // queued but never sent before Ns_ConnClose.
+                            conn.set_header("X-Big", &"x".repeat(64 << 20));
+                            conn.queue_headers(200);
+                            conn.close();
+                            flag.store(true, Ordering::SeqCst);
+                            nsd::Status::Ok
+                        }),
+                        desc: "qh".into(),
+                    },
+                    ns_core::UrlFlags::default(),
+                );
+            }
+            Ok(())
+        }),
+    );
+    let srv = TestServer::start_with(
+        "ns_section ns/server/s1/modules\nns_param qh qh.so\n\
+         ns_section ns/server/s1/module/nssock\nns_param sendwait 1",
+        |_| {},
+        modules,
+    );
+    // A client that sends a request and then never reads.
+    let mut s = TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+    s.write_all(b"GET /qh HTTP/1.0\r\n\r\n").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !closed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        closed.load(Ordering::SeqCst),
+        "Conn::close blocked on a client that does not read"
+    );
+    drop(s);
+}
+
+#[test]
+fn driver_name_is_fixed_not_module_instance() {
+    // Ns_DriverInit: drvPtr->name = init->name ("nssock"), module = the
+    // instance name from the config.
+    let srv = TestServer::start(
+        "ns_section ns/server/s1/modules\nns_param web2 nssock.so\n\
+         ns_section ns/server/s1/module/web2\nns_param port 0\n\
+         ns_param address 127.0.0.1\nns_param hostname localhost",
+        |home| {
+            let lib = home.join("servers/s1/modules/tcl");
+            std::fs::create_dir_all(&lib).unwrap();
+            std::fs::write(
+                lib.join("drv.tcl"),
+                "ns_register_proc GET /drv drv_proc\n\
+                 proc drv_proc {} { ns_return 200 text/plain [ns_conn driver] }\n",
+            )
+            .unwrap();
+        },
+    );
+    let drivers = srv.nsd.drivers();
+    let web2 = drivers
+        .iter()
+        .find(|d| d.info.module == "web2")
+        .expect("web2 driver");
+    assert_eq!(web2.info.name, "nssock");
+    let mut s = TcpStream::connect(("127.0.0.1", web2.info.port())).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(b"GET /drv HTTP/1.0\r\n\r\n").unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    assert_eq!(Response::parse(&out).body, "nssock", "{out}");
+}
