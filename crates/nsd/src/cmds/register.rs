@@ -84,8 +84,11 @@ impl ScriptProc {
             s.push(' ');
             s.push_str(&tcl_quote(self.args.as_deref().unwrap_or("")));
         }
-        s.push(' ');
-        s.push_str(why.name());
+        // As in ProcFilter: void traces (ns_register_trace) get no `why`.
+        if why != FilterWhen::VoidTrace {
+            s.push(' ');
+            s.push_str(why.name());
+        }
         s
     }
 }

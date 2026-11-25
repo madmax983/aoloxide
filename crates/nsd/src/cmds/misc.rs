@@ -100,7 +100,7 @@ fn ns_log(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
             argv[1]
         ))
     })?;
-    let msg = argv[2..].concat();
+    let msg = argv[2..].join(" ");
     server(interp)?.global.log(sev, &msg);
     Ok(String::new())
 }

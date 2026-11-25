@@ -79,6 +79,9 @@ fn ns_cache(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         }
         return Ok(String::new());
     }
+    if opt == "eval" {
+        return cache_eval(interp, argv);
+    }
     let c = get_cache(interp, &argv[2])?;
     let cache = &c.cache;
     match opt {
@@ -148,46 +151,59 @@ fn ns_cache(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
             }
             Ok(String::new())
         }
-        _ => {
-            // eval ?-timeout t? ?-force? cache key script
-            let mut i = 3;
-            let mut maxwait = c.maxwait;
-            let mut force = false;
-            while i < argv.len() && argv[i].starts_with('-') && argv.len() - i > 2 {
-                match argv[i].as_str() {
-                    "-timeout" => {
-                        maxwait = Some(time_arg(argv.get(i + 1).map_or("", String::as_str))?);
-                        i += 2;
-                    }
-                    "-force" => {
-                        force = true;
-                        i += 1;
-                    }
-                    _ => break,
-                }
+        _ => Err(Exception::error(format!(
+            "unknown ns_cache option \"{opt}\""
+        ))),
+    }
+}
+
+/// `ns_cache eval ?-timeout t? ?-force? cache key script`.
+fn cache_eval(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
+    let mut i = 2;
+    let mut timeout = None;
+    let mut force = false;
+    while i < argv.len() && argv[i].starts_with('-') {
+        match argv[i].as_str() {
+            "-timeout" => {
+                timeout = Some(time_arg(argv.get(i + 1).map_or("", String::as_str))?);
+                i += 2;
             }
-            if argv.len() - i != 2 {
-                return Err(wrong_args(argv, 3, "key script"));
+            "-force" => {
+                force = true;
+                i += 1;
             }
-            let (key, script) = (&argv[i], &argv[i + 1]);
-            if force {
-                cache.remove(key);
+            "--" => {
+                i += 1;
+                break;
             }
-            cache
-                .get_or_compute(key, maxwait, || {
-                    interp.eval(script).map(|v| {
-                        let l = v.len();
-                        (v, l)
-                    })
-                })
-                .map_err(|e| match e {
-                    CacheError::Timeout => {
-                        Exception::error("timeout waiting for value").error_code("NS_TIMEOUT")
-                    }
-                    CacheError::Compute(e) => e,
-                })
+            _ => break,
         }
     }
+    if argv.len() != i + 3 {
+        return Err(wrong_args(
+            argv,
+            2,
+            "?-timeout t? ?-force? cache key script",
+        ));
+    }
+    let c = get_cache(interp, &argv[i])?;
+    let (key, script) = (&argv[i + 1], &argv[i + 2]);
+    if force {
+        c.cache.remove(key);
+    }
+    c.cache
+        .get_or_compute(key, timeout.or(c.maxwait), || {
+            interp.eval(script).map(|v| {
+                let l = v.len();
+                (v, l)
+            })
+        })
+        .map_err(|e| match e {
+            CacheError::Timeout => {
+                Exception::error("timeout waiting for value").error_code("NS_TIMEOUT")
+            }
+            CacheError::Compute(e) => e,
+        })
 }
 
 fn ns_cache_names(interp: &dyn Interp, argv: &[String]) -> ScriptResult {

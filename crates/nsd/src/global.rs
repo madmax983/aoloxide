@@ -329,6 +329,7 @@ impl Global {
             wrappers: crate::driver::WrapperRegistry::default(),
             env_lock: Mutex::new(()),
         });
+        g.pools.limits_or_create("default");
         Ok(g)
     }
 
