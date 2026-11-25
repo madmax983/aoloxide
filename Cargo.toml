@@ -14,7 +14,7 @@ authors = ["aoloxide contributors"]
 thiserror = "2"
 anyhow = "1"
 encoding_rs = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
 proptest = "1"
 libc = "0.2"
 flate2 = "1"
@@ -53,6 +53,13 @@ missing_errors_doc = "allow"
 needless_range_loop = "allow"
 many_single_char_names = "allow"
 too_long_first_doc_paragraph = "allow"
+match_same_arms = "allow"
+format_push_string = "allow"
+unnecessary_wraps = "allow"
+type_complexity = "allow"
+missing_fields_in_debug = "allow"
+implicit_hasher = "allow"
+useless_let_if_seq = "allow"
 
 [profile.release]
 lto = "thin"
