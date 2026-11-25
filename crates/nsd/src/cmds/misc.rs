@@ -582,12 +582,7 @@ fn ns_addrbyhost(_interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     let host = argv
         .get(if all { 2 } else { 1 })
         .ok_or_else(|| wrong_args(argv, 1, "?-all? host"))?;
-    let addrs: Vec<String> = (host.as_str(), 0)
-        .to_socket_addrs()
-        .map_err(|e| Exception::error(format!("could not lookup {host}: {e}")))?
-        .filter(std::net::SocketAddr::is_ipv4)
-        .map(|a| a.ip().to_string())
-        .collect();
+    let addrs = ns_core::dns::addrs_by_host(host);
     if addrs.is_empty() {
         return Err(Exception::error(format!("could not lookup {host}")));
     }
@@ -600,50 +595,8 @@ fn ns_addrbyhost(_interp: &dyn Interp, argv: &[String]) -> ScriptResult {
 
 fn ns_hostbyaddr(_interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     check_args(argv, 2, 2, 1, "address")?;
-    let ip: std::net::IpAddr = argv[1]
-        .parse()
-        .map_err(|_| Exception::error(format!("invalid address: {}", argv[1])))?;
-    let sa = std::net::SocketAddr::new(ip, 0);
-    let (storage, len) = match sa {
-        std::net::SocketAddr::V4(v4) => {
-            let mut s: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            s.sin_family = libc::AF_INET as libc::sa_family_t;
-            s.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
-            // SAFETY: sockaddr_in fits in sockaddr_storage.
-            let mut st: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (&raw const s).cast::<u8>(),
-                    (&raw mut st).cast::<u8>(),
-                    std::mem::size_of_val(&s),
-                )
-            };
-            (st, std::mem::size_of::<libc::sockaddr_in>())
-        }
-        std::net::SocketAddr::V6(_) => {
-            return Err(Exception::error("IPv6 reverse lookup not supported"))
-        }
-    };
-    let mut host = vec![0 as libc::c_char; 1025];
-    // SAFETY: storage/len describe a valid sockaddr; host is writable.
-    let rc = unsafe {
-        libc::getnameinfo(
-            (&raw const storage).cast::<libc::sockaddr>(),
-            len as libc::socklen_t,
-            host.as_mut_ptr(),
-            host.len() as libc::socklen_t,
-            std::ptr::null_mut(),
-            0,
-            libc::NI_NAMEREQD,
-        )
-    };
-    if rc != 0 {
-        return Err(Exception::error(format!("could not lookup {}", argv[1])));
-    }
-    // SAFETY: getnameinfo NUL-terminates on success.
-    Ok(unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) }
-        .to_string_lossy()
-        .into_owned())
+    ns_core::dns::host_by_addr(&argv[1])
+        .ok_or_else(|| Exception::error(format!("could not lookup {}", argv[1])))
 }
 
 /// Width and height of a GIF.

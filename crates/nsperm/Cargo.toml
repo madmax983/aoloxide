@@ -1,0 +1,19 @@
+[package]
+name = "nsperm"
+description = "AOLserver nsperm module: users, groups and URL permissions with Basic auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nsd = { path = "../nsd" }
+ns-core = { path = "../ns-core" }
+ns-script = { path = "../ns-script" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

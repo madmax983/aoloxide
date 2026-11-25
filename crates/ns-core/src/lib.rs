@@ -15,6 +15,7 @@
 //! | [`httptime`] | `nsd/httptime.c` |
 //! | [`text`] | `nsd/quotehtml.c`, `nsd/uuencode.c` |
 //! | [`crypt`] | `nsd/crypt.c` |
+//! | [`dns`] | `nsd/dns.c` |
 //! | [`mimetypes`] | `nsd/mimetypes.c` |
 //! | [`config`] | `nsd/config.c` |
 //! | [`cache`] | `nsd/cache.c` |
@@ -24,6 +25,7 @@
 pub mod cache;
 pub mod config;
 pub mod crypt;
+pub mod dns;
 pub mod form;
 pub mod glob;
 pub mod httptime;

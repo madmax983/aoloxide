@@ -1,0 +1,29 @@
+[package]
+name = "aoloxide"
+description = "AOLserver ported to Rust: the nsd server binary with all modules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+default-run = "nsd"
+
+[[bin]]
+name = "nsd"
+path = "src/main.rs"
+
+[dependencies]
+nsd = { path = "../nsd" }
+ns-core = { path = "../ns-core" }
+nslog = { path = "../nslog" }
+nsperm = { path = "../nsperm" }
+nscgi = { path = "../nscgi" }
+ns-tcl = { path = "../ns-tcl" }
+anyhow.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
