@@ -82,7 +82,10 @@ mod tests {
     #[test]
     fn lookups() {
         assert!(addrs_by_host("localhost").iter().any(|a| a == "127.0.0.1"));
-        assert!(addrs_by_host("no-such-host.invalid").is_empty());
+        assert_eq!(
+            addrs_by_host("no-such-host.invalid"),
+            [] as [std::string::String; 0]
+        );
         assert!(host_by_addr("not an address").is_none());
         // 127.0.0.1 normally reverse-resolves via /etc/hosts; don't require it.
         let _ = host_by_addr("127.0.0.1");

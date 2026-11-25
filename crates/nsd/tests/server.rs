@@ -115,7 +115,7 @@ proc internal_proc {} { ns_internalredirect /hello }
         .into_iter()
         .filter(|l| l.contains("Error:"))
         .collect();
-    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(errors.len(), 0, "{errors:?}");
     assert_eq!(r.body, "hello Mark from /hello via GET");
 
     let body = "a=1&b=two+words";

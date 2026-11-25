@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(r.urlv, vec!["dir"]);
         let root = Request::parse("GET / HTTP/1.0", None).expect("parse");
         assert_eq!(root.url, "/");
-        assert!(root.urlv.is_empty());
+        assert_eq!(root.urlv, [] as [std::string::String; 0]);
     }
 
     #[test]

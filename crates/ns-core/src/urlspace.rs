@@ -451,7 +451,7 @@ mod tests {
         );
         assert_eq!(u.get("GET", "/a/x.html"), None);
         assert_eq!(u.get("GET", "/a"), None);
-        assert!(u.is_empty());
+        assert!(u.entries().is_empty(), "urlspace should be empty");
     }
 
     #[test]
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn segments_ignore_empty() {
         assert_eq!(url_segments("//a///b/"), vec!["a", "b"]);
-        assert!(url_segments("/").is_empty());
+        assert_eq!(url_segments("/"), [] as [std::string::String; 0]);
     }
 
     proptest! {

@@ -517,6 +517,6 @@ mod tests {
     fn default_state() {
         let s = AdpState::default();
         assert_eq!(s.exception, AdpException::Ok);
-        assert!(s.outputs.is_empty());
+        assert_eq!(s.outputs.len(), 0);
     }
 }

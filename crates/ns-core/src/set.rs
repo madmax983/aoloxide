@@ -314,7 +314,7 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert!(s.delete_key("a"));
         assert!(!s.delete_key("a"));
-        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
         assert_eq!(s.last_index(), None);
     }
 
@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(high.to_pairs(), vec!["a", "1", "b", "2"]);
         let mut from = low.clone();
         high.move_from(&mut from);
-        assert!(from.is_empty());
+        assert_eq!(from.len(), 0);
         assert_eq!(high.len(), 4);
     }
 

@@ -816,7 +816,7 @@ mod tests {
         let i = info();
         let (r, _) = rt().block_on(parse(b"GET /old\r\n", &i)).expect("read");
         assert_eq!(r.request.major, 0);
-        assert!(r.headers.is_empty());
+        assert_eq!(r.headers.len(), 0);
     }
 
     #[test]

@@ -59,15 +59,18 @@ jobs:
     name: verus proofs
     runs-on: ubuntu-latest
     env:
-      # Pinned rolling release; bump deliberately.
-      VERUS_RELEASE: 0.2026.11.25.48ed2e8
       RUSTFLAGS: ""
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
-      - name: Download Verus
+      - name: Download the latest Verus release
+        # Verus publishes "rolling" releases and deletes old ones, so a
+        # pinned URL goes stale; resolve the newest x86-linux asset instead.
         run: |
-          curl -sSfL -o verus.zip \
-            "https://github.com/verus-lang/verus/releases/download/release%2Frolling%2F${VERUS_RELEASE}/verus-${VERUS_RELEASE}-x86-linux.zip"
+          url=$(gh api 'repos/verus-lang/verus/releases?per_page=10' \
+            --jq '[.[].assets[] | select(.name | endswith("x86-linux.zip"))][0].browser_download_url')
+          echo "Verus asset: $url"
+          curl -sSfL -o verus.zip "$url"
           unzip -q verus.zip
           cat verus-x86-linux/version.json
       - name: Install the Rust toolchain Verus was built against

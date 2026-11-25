@@ -638,7 +638,7 @@ mod tests {
             (vec!["GET".to_owned()], "/*.adp".to_owned())
         );
         assert_eq!(parse_map("/*.adp").0.len(), 3);
-        assert!(parse_map("").0.is_empty());
+        assert_eq!(parse_map("").0.len(), 0);
     }
 
     #[test]

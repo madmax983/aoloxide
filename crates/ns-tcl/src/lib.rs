@@ -588,7 +588,7 @@ mod tests {
         assert!(!i.marked_for_delete());
         i.mark_for_delete();
         assert!(i.marked_for_delete());
-        assert!(i.error_info().is_empty() || !i.error_info().is_empty());
+        let _ = i.error_info();
         let _ = i
             .eval_file("/nonexistent/file.tcl")
             .expect_err("missing file");

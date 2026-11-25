@@ -522,6 +522,6 @@ mod tests {
         assert!(s.cancel(id));
         assert!(!s.cancel(9999));
         s.shutdown(Duration::from_secs(2));
-        assert!(s.events().is_empty());
+        assert_eq!(s.events().len(), 0);
     }
 }

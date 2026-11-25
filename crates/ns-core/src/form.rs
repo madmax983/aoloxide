@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(f.fields.get("name"), Some("Mark"));
         assert_eq!(f.fields.get("v"), Some("A"));
         assert_eq!(f.fields.get("q"), None);
-        assert!(parse_form("POST", None, None, b"", None).fields.is_empty());
+        assert_eq!(parse_form("POST", None, None, b"", None).fields.len(), 0);
     }
 
     #[test]
