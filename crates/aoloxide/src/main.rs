@@ -81,8 +81,8 @@ fn run() -> Result<()> {
         bail!("required -t <config> option not specified");
     };
     let mut opts = NsdOptions::from_file(config)?;
-    opts.args = args.rest.clone();
-    opts.server = args.server.clone();
+    opts.args.clone_from(&args.rest);
+    opts.server.clone_from(&args.server);
     opts.log_stderr = args.foreground;
     opts.modules = aoloxide::modules();
     if args.check {
