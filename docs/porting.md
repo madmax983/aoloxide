@@ -113,10 +113,7 @@ Modules:
     thread, so `-sendtimeout` and `-recvtimeout` are accepted and reported
     but have no effect; `-evaltimeout` and `-waittimeout` behave as in
     AOLserver.
-
-nscp:
-
-20 (nscp). The control port parses input as a byte stream, not per
+20. **nscp:** The control port parses input as a byte stream, not per
     `recv()` chunk as `GetLine` does.  `IAC EOF`, `IAC IP`, a line that
     starts with EOT (Ctrl-D) and end of input (even after a partial line)
     still end the session, and any other telnet command still logs
@@ -129,46 +126,37 @@ nscp:
     client that sent its password at once lost it to that flush.  Each
     line is read up to `\n` (CR and NUL bytes are dropped), so several
     lines arriving in one packet are evaluated one command at a time.
-
-nszlib:
-
-20 (core-ssl-zlib). `ns_zlib uncompress` and `gunzip` decode their result
+21. **nszlib:** `ns_zlib uncompress` and `gunzip` decode their result
     as Tcl 8.6 reads bytes: valid UTF-8 is decoded, `C0 80` is NUL and any
     other invalid byte is its Latin-1 character.  Tcl also decodes
     UTF-8-encoded surrogates (`ED A0 80`) to lone UTF-16 surrogates; script
     strings here cannot hold those, so each such byte is its Latin-1
     character instead.
-
-nsdb:
-
-20 (nsdb). A handle reconnected after `ns_db bouncepool` counts as current.
+22. **nsdb:** A handle reconnected after `ns_db bouncepool` counts as current.
     AOLserver never updated a reconnected handle's bounce count, so a
     handle that was in use during a bounce was closed again on every later
     return to the pool.
-21 (nsdb). `ns_db` subcommands given the wrong number of arguments raise
+23. **nsdb:** `ns_db` subcommands given the wrong number of arguments raise
     the "wrong # args" error.  For the handle subcommands (`select`,
     `releasehandle`, ...) AOLserver set that message but returned `TCL_OK`.
-22 (nsdb). Deleting an interp returns the handles it still holds to their
+24. **nsdb:** Deleting an interp returns the handles it still holds to their
     pools (AOLserver's `FreeData` dropped them, shrinking the pool).  The
     SQLite driver treats a statement of only whitespace or comments (for
     example between two `;` in `interpretsqlfile`) as an empty DML command,
     and reports errors without a SQLite code as exception `NSDB`.
-
-nsproxy:
-
-20 (nsproxy). `ns_proxy config` accepts `-gettimeout` as an alias of
+25. **nsproxy:** `ns_proxy config` accepts `-gettimeout` as an alias of
     AOLserver's `-getimeout` (the flag reported back is `-getimeout`).
-21 (nsproxy). A failed `ns_proxy get` returns its proxies the way
+26. **nsproxy:** A failed `ns_proxy get` returns its proxies the way
     `ns_proxy release` does: a proxy whose return leaves no spare capacity
     (`-max` was lowered while the handles were being checked) is freed
     rather than put on the free list, so idle workers never exceed the
     spare capacity (proved in `verus/proxy.rs`).  AOLserver put them all
     back on the free list.
-22 (nsproxy). When the ping or `-init` script of a handle being checked
+27. **nsproxy:** When the ping or `-init` script of a handle being checked
     out fails, the proxy is reset to idle with its worker closed.
     AOLserver left a timed-out proxy marked busy, so the replacement
     worker's `-init` (or the caller's first `eval`) failed with `EBusy`.
-23 (nsproxy). Protocol messages are capped at 256 MiB, and the worker's
+28. **nsproxy:** Protocol messages are capped at 256 MiB, and the worker's
     private protocol descriptors are close-on-exec.  A closing worker is
     reaped by polling for its exit rather than for EOF on its result pipe;
     the `SIGTERM`/`SIGKILL` sequence and its warnings match AOLserver.
