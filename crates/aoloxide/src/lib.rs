@@ -21,6 +21,7 @@ pub fn modules() -> ModuleRegistry {
     r.register("nsopenssl", Arc::new(nssl::init));
     r.register("nszlib", Arc::new(nszlib::init));
     r.register("nscp", Arc::new(nscp::init));
+    r.register("nsdb", Arc::new(nsdb::init));
     r
 }
 

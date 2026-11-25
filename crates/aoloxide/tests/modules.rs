@@ -372,3 +372,60 @@ fn nscp_control_port() {
         .iter()
         .any(|l| l.contains("nscp: admin 1: expr {6 * 7}")));
 }
+
+#[test]
+fn nsdb_sqlite_pool() {
+    let dbfile = tempfile::NamedTempFile::new().unwrap();
+    let extra = format!(
+        "ns_section ns/db/drivers\nns_param sqlite nssqlite.so\n\
+         ns_section ns/db/pools\nns_param main \"Main DB\"\n\
+         ns_section ns/db/pool/main\nns_param driver sqlite\nns_param datasource {}\nns_param connections 2\n\
+         ns_section ns/server/s1/db\nns_param pools *\nns_param defaultpool main",
+        dbfile.path().display()
+    );
+    let srv = boot("ns_param nsdb nsdb.so", &extra, |h| {
+        let lib = h.join("servers/s1/modules/tcl");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            lib.join("db.tcl"),
+            r#"
+ns_register_proc GET /db db_proc
+proc db_proc {} {
+    set db [ns_db gethandle]
+    ns_db dml $db "create table if not exists t (id integer, name text)"
+    ns_db dml $db "delete from t"
+    ns_db dml $db "insert into t values (1, [ns_dbquotevalue alice])"
+    ns_db dml $db "insert into t values (2, 'bob')"
+    set out {}
+    set row [ns_db select $db "select id, name from t order by id"]
+    while {[ns_db getrow $db $row]} {
+        lappend out "[ns_set get $row id]=[ns_set get $row name]"
+    }
+    set one [ns_db 1row $db "select count(*) as n from t"]
+    lappend out n=[ns_set get $one n]
+    lappend out none=[ns_db 0or1row $db "select * from t where id = 99"]
+    lappend out [ns_db exec $db "select 1"] [ns_db exec $db "update t set name = name"]
+    lappend out [catch {ns_db 1row $db "select * from t"} m] $m
+    lappend out [catch {ns_db select $db "select * from nosuch"} m] [string match {Database operation "select" failed*} $m]
+    lappend out [ns_db poolname $db] [ns_db dbtype $db] [ns_db driver $db] [ns_db pools] [ns_pooldescription main]
+    lappend out [llength [ns_db gethandle main 1]]
+    ns_db releasehandle $db
+    ns_return 200 text/plain $out
+}
+"#,
+        )
+        .unwrap();
+    });
+    let r = request(srv.port, "GET /db HTTP/1.0\r\n\r\n");
+    let body = r.split("\r\n\r\n").nth(1).unwrap_or("");
+    assert_eq!(
+        body,
+        "1=alice 2=bob n=2 none= NS_ROWS NS_DML 1 {Query returned more than one row.} 1 1 main SQLite sqlite main {Main DB} 1",
+        "{r} {:?}",
+        srv.nsd.global.log.captured()
+    );
+    // The second handle taken above was released by ns_cleanup: both
+    // handles are available again on the next request.
+    let r = request(srv.port, "GET /db HTTP/1.0\r\n\r\n");
+    assert!(r.contains("1=alice 2=bob"), "{r}");
+}

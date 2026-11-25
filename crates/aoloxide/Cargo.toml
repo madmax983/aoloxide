@@ -21,6 +21,7 @@ nscgi = { path = "../nscgi" }
 nssl = { path = "../nsssl", package = "nsssl" }
 nszlib = { path = "../nszlib" }
 nscp = { path = "../nscp" }
+nsdb = { path = "../nsdb" }
 ns-tcl = { path = "../ns-tcl" }
 anyhow.workspace = true
 libc.workspace = true
