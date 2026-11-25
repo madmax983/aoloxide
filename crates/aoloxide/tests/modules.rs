@@ -328,3 +328,47 @@ fn nszlib_command() {
     let r = request(srv.port, "GET /z HTTP/1.0\r\n\r\n");
     assert!(r.ends_with("roundtrip"), "{r}");
 }
+
+#[test]
+fn nscp_control_port() {
+    let pass = ns_core::crypt::crypt("secret", "xy");
+    let extra = format!(
+        "ns_section ns/server/s1/module/nscp\nns_param address 127.0.0.1\nns_param port 0\nns_param cpcmdlogging true\n\
+         ns_section ns/server/s1/module/nscp/users\nns_param user \"admin:{pass}\""
+    );
+    let srv = boot("ns_param nscp nscp.so", &extra, |_| {});
+    let port: u16 = srv.nsd.server("s1").unwrap().nsv.with("nscp", false, |a| {
+        a.unwrap().get("port").unwrap().parse().unwrap()
+    });
+    let session = |input: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.write_all(input.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let out = session(
+        "admin\nsecret\nexpr {6 * 7}\nset x [list a \\\nb]\nnsv_set cp k v\nerror oops\nexit\n",
+    );
+    assert!(out.contains("Welcome to s1"), "{out}");
+    assert!(out.contains("42\r\n"), "{out}");
+    assert!(out.contains("s1:nscp 2>>> "), "continuation prompt: {out}");
+    assert!(out.contains("a b\r\n"));
+    assert!(out.contains("oops\r\n"));
+    let v = srv
+        .nsd
+        .server("s1")
+        .unwrap()
+        .nsv
+        .with("cp", false, |a| a.and_then(|a| a.get("k").cloned()));
+    assert_eq!(v.as_deref(), Some("v"));
+    assert!(session("admin\nwrong\n").contains("Access denied!"));
+    assert!(srv
+        .nsd
+        .global
+        .log
+        .captured()
+        .iter()
+        .any(|l| l.contains("nscp: admin 1: expr {6 * 7}")));
+}

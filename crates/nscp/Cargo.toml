@@ -1,0 +1,19 @@
+[package]
+name = "nscp"
+description = "AOLserver nscp module: telnet control port with a Tcl shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nsd = { path = "../nsd" }
+ns-core = { path = "../ns-core" }
+ns-script = { path = "../ns-script" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

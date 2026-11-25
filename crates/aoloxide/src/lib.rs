@@ -20,6 +20,7 @@ pub fn modules() -> ModuleRegistry {
     r.register("nsssl", Arc::new(nssl::init));
     r.register("nsopenssl", Arc::new(nssl::init));
     r.register("nszlib", Arc::new(nszlib::init));
+    r.register("nscp", Arc::new(nscp::init));
     r
 }
 
@@ -177,7 +178,9 @@ mod tests {
     #[test]
     fn modules_and_home() {
         let m = modules();
-        for n in ["nssock", "nslog", "nsperm", "nscgi", "nsssl", "nszlib"] {
+        for n in [
+            "nssock", "nslog", "nsperm", "nscgi", "nsssl", "nszlib", "nscp",
+        ] {
             assert!(m.get(n).is_some(), "{n}");
         }
         let d = tempfile::tempdir().expect("tmp");

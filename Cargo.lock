@@ -23,6 +23,7 @@ dependencies = [
  "ns-core",
  "ns-tcl",
  "nscgi",
+ "nscp",
  "nsd",
  "nslog",
  "nsperm",
@@ -341,6 +342,16 @@ dependencies = [
 
 [[package]]
 name = "nscgi"
+version = "0.1.0"
+dependencies = [
+ "ns-core",
+ "ns-script",
+ "nsd",
+ "tempfile",
+]
+
+[[package]]
+name = "nscp"
 version = "0.1.0"
 dependencies = [
  "ns-core",
