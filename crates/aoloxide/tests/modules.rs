@@ -410,7 +410,8 @@ proc db_proc {} {
     lappend out [catch {ns_db 1row $db "select * from t"} m] $m
     lappend out [catch {ns_db select $db "select * from nosuch"} m] [string match {Database operation "select" failed*} $m]
     lappend out [ns_db poolname $db] [ns_db dbtype $db] [ns_db driver $db] [ns_db pools] [ns_pooldescription main]
-    lappend out [llength [ns_db gethandle main 1]]
+    # The thread already owns a handle from main: a nested gethandle fails.
+    lappend out [catch {ns_db gethandle main 1} m] $m $db
     ns_db releasehandle $db
     ns_return 200 text/plain $out
 }
@@ -422,8 +423,15 @@ proc db_proc {} {
     let body = r.split("\r\n\r\n").nth(1).unwrap_or("");
     assert_eq!(
         body,
-        "1=alice 2=bob n=2 none= NS_ROWS NS_DML 1 {Query returned more than one row.} 1 1 main SQLite sqlite main {Main DB} 1",
+        "1=alice 2=bob n=2 none= NS_ROWS NS_DML 1 {Database operation \"1row\" failed (exception NSINT, \"Query returned more than one row.\")} 1 1 main SQLite sqlite main {Main DB} 1 {could not allocate 1 handle(s) from pool \"main\"} nsdb0",
         "{r} {:?}",
+        srv.nsd.global.log.captured()
+    );
+    assert!(
+        srv.nsd.global.log.captured().iter().any(|l| l.contains(
+            "dbinit: db handle limit exceeded: thread already owns 1 handle from pool 'main'"
+        )),
+        "{:?}",
         srv.nsd.global.log.captured()
     );
     // The second handle taken above was released by ns_cleanup: both
@@ -473,15 +481,31 @@ proc proxy_proc {} {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn nsdb_handle_subcommands_and_misconfig() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("x.sqlite");
-    let sqlfile = dir.path().join("schema.sql");
+    // Ns_DbInterpretSqlFile: `--` comments only at the start of a line,
+    // `;` inside single quotes, doubled quotes kept.
     std::fs::write(
-        &sqlfile,
-        "create table s (a integer);\ninsert into s values (1);\ninsert into s values (2);\n",
+        dir.path().join("schema.sql"),
+        "-- schema\ncreate table s (a integer, b text);\ninsert into s values (1, 'x;y');\n\
+         -- second\ninsert into s values (2, 'it''s');\n",
     )
     .unwrap();
+    // A trailing statement without `;` is an error and is not run.
+    std::fs::write(
+        dir.path().join("bad.sql"),
+        "insert into s values (9, 'z')\n",
+    )
+    .unwrap();
+    // Double quotes do not protect a `;`.
+    std::fs::write(
+        dir.path().join("dq.sql"),
+        "insert into s values (3, \"a;b\");\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("x.csv"), " a , b ,\"c \",\n\n").unwrap();
     let extra = format!(
         "ns_section ns/db/drivers\nns_param sqlite nssqlite.so\nns_param bogus nsbogus.so\n\
          ns_section ns/db/pools\nns_param one One\nns_param nodrv x\nns_param baddrv x\nns_param nods x\nns_param hidden H\n\
@@ -499,41 +523,77 @@ ns_register_proc GET /dbx dbx_proc
 proc dbx_proc {} {
     set out {}
     set h [ns_db gethandle one]
-    lappend out [ns_db pools] [ns_db datasource $h] [ns_db user $h] [ns_db password $h]
+    lappend out $h [ns_db pools] [ns_db datasource $h] [ns_db user $h] [ns_db password $h]
     lappend out [ns_db verbose $h] [ns_db verbose $h off] [ns_db verbose $h on]
-    ns_db interpretsqlfile $h SQLFILE
-    lappend out [ns_db 1row $h "select count(*) as n from s"]
+    lappend out [catch {ns_db verbose $h maybe} m] $m
+    ns_db interpretsqlfile $h SQLDIR/schema.sql
+    lappend out [ns_set get [ns_db 1row $h "select count(*) as n from s"] n]
+    lappend out [ns_set get [ns_db 1row $h "select b from s where a = 1"] b]
+    lappend out [ns_set get [ns_db 1row $h "select b from s where a = 2"] b]
+    lappend out [catch {ns_db interpretsqlfile $h SQLDIR/bad.sql} m] $m
+    lappend out [catch {ns_db interpretsqlfile $h SQLDIR/dq.sql} m] [string match {Database operation "interpretsqlfile" failed (exception *} $m]
+    lappend out [catch {ns_db interpretsqlfile $h SQLDIR/missing.sql} m] $m
     lappend out [ns_set get [ns_db 1row $h "select count(*) as n from s"] n]
     lappend out [catch {ns_db select $h "delete from s where a = 99"} m] $m
     lappend out [catch {ns_db dml $h "select * from s"} m] $m
+    lappend out [ns_db exception $h] [ns_dberrorcode $h] [ns_dberrormsg $h]
     lappend out [catch {ns_db 1row $h "select * from s where a = 99"} m] $m
+    lappend out [catch {ns_db 0or1row $h "select * from s"} m] $m
+    lappend out [ns_db connected $h] [ns_db exception $h]
     set row [ns_db select $h "select a from s order by a"]
+    lappend out [catch {ns_db getrow $h nosuchset} m] $m
+    lappend out [ns_db getrow $h $row] [ns_set get $row a]
     lappend out [ns_set size [ns_db bindrow $h]]
     ns_db flush $h
     lappend out [ns_db getrow $h $row]
-    lappend out [catch {ns_db dml $h "insert into nosuch values (1)"} m] [string match {Database operation "dml" failed*} $m]
+    lappend out [catch {ns_db dml $h "insert into nosuch values (1)"} m] [string match {Database operation "dml" failed (exception *} $m]
     lappend out [ns_db resethandle $h] [ns_db connected $h]
     ns_db setexception $h 42000 "my message"
     lappend out [ns_db exception $h]
     lappend out [catch {ns_db setexception $h 123456 x} m] $m
     lappend out [catch {ns_db sp_start $h p} m] $m
-    # One connection: a second handle times out (empty result).
-    lappend out [ns_db gethandle -timeout 0.1 one]
+    lappend out [catch {ns_db gethandle one} m] $m
+    lappend out [catch {ns_db gethandle one 0} m] $m
+    lappend out [catch {ns_db gethandle one 2} m] $m
+    lappend out [catch {ns_db gethandle one 1 extra} m] $m
+    lappend out [catch {ns_db gethandle -timeout x one} m] $m
+    # Another thread: the only handle is held here, so a timed wait gives "".
+    lappend out [ns_thread wait [ns_thread begin {ns_db gethandle -timeout 0 one}]]
+    # Handle ids belong to the interp that took them.
+    lappend out [ns_thread wait [ns_thread begin "ns_db poolname $h"]]
+    lappend out [ns_thread wait [ns_thread begin "ns_db releasehandle $h"]] [ns_db poolname $h]
+    # A negative timeout waits for ever.
+    set tid [ns_thread begin {ns_db gethandle -timeout -1 one}]
+    after 300
+    ns_db releasehandle $h
+    lappend out [ns_thread wait $tid]
+    set h [ns_db gethandle one]
     lappend out [catch {ns_db gethandle hidden} m] $m
     lappend out [catch {ns_db gethandle nosuch} m] $m
     lappend out [catch {ns_db bouncepool nosuch} m] $m
+    lappend out [ns_db bouncepool hidden] [ns_pooldescription hidden] [ns_pooldescription nosuch]
     ns_db disconnect $h
-    lappend out [ns_db connected $h]
+    lappend out [ns_db connected $h] [ns_db dbtype $h]
+    lappend out [catch {ns_db select $h "select 1"} m] $m
+    lappend out [catch {ns_db flush $h} m] $m
     ns_db releasehandle $h
+    lappend out [catch {ns_db releasehandle $h} m] $m
     ns_db bouncepool one
-    lappend out [catch {ns_db poolname $h} m] $m
     set h [ns_db gethandle]
-    lappend out [ns_db 0or1row $h "select a from s where a = 2"]
+    lappend out $h [ns_set get [ns_db 0or1row $h "select a from s where a = 2"] a]
     ns_db releasehandle $h
+    lappend out [ns_quotelisttolist {a b 'c d'}] [ns_quotelisttolist {'it''s'}] [ns_quotelisttolist {'a','b'}]
+    set f [open SQLDIR/x.csv]
+    set cols unset
+    lappend out [ns_getcsv $f cols] $cols
+    lappend out [ns_getcsv $f cols] $cols
+    lappend out [ns_getcsv $f cols] $cols
+    close $f
+    lappend out [catch {ns_db select nsdb0} m] $m [catch {ns_db releasehandle} m] $m
     ns_return 200 text/plain $out
 }
 "#
-    .replace("SQLFILE", &sqlfile.display().to_string());
+    .replace("SQLDIR", &dir.path().display().to_string());
     let srv = boot("ns_param nsdb nsdb.so", &extra, |h| {
         let lib = h.join("servers/s1/modules/tcl");
         std::fs::create_dir_all(&lib).unwrap();
@@ -544,70 +604,171 @@ proc dbx_proc {} {
     let log = srv.nsd.global.log.captured();
     let i = ns_tcl::TclEngine::new().create_interp().unwrap();
     let items = i.list_split(body).unwrap_or_default();
-    assert!(items.len() > 20, "{r} {log:?}");
-    assert_eq!(
-        &items[..7],
-        [
-            "one",
-            db.display().to_string().as_str(),
-            "scott",
-            "tiger",
-            "1",
-            "0",
-            "1"
-        ]
-    );
-    assert!(
-        items[7].starts_with('d'),
-        "1row returns a set id: {}",
-        items[7]
-    );
-    assert_eq!(items[8], "2");
-    assert_eq!(
-        &items[9..15],
-        [
-            "1",
-            "Query was not a statement returning rows.",
-            "1",
-            "Query was not a DML or DDL command.",
-            "1",
-            "Query did not return a row."
-        ]
-    );
-    assert_eq!(&items[15..19], ["1", "0", "1", "1"]);
-    assert_eq!(&items[19..21], ["NS_OK", "1"]);
-    assert_eq!(items[21], "42000 {my message}");
-    assert_eq!(
-        &items[22..24],
-        ["1", "code \"123456\" more than 5 characters"]
-    );
-    assert_eq!(items[24], "1");
-    assert!(items[25].contains("not supported"), "{}", items[25]);
-    assert_eq!(items[26], "", "gethandle timeout yields an empty result");
-    assert_eq!(&items[27..29], ["1", "no access to pool: \"hidden\""]);
-    assert_eq!(&items[29..31], ["1", "no access to pool: \"nosuch\""]);
-    assert_eq!(&items[31..33], ["1", "could not bounce: nosuch"]);
-    assert_eq!(items[33], "0");
-    assert_eq!(items[34], "1");
-    assert!(
-        items[35].starts_with("invalid database id"),
-        "{}",
-        items[35]
-    );
-    assert!(
-        items[36].starts_with('d'),
-        "0or1row found a row: {}",
-        items[36]
-    );
+    assert!(items.len() > 80, "{r} {log:?}");
+    let ds = db.display().to_string();
+    let want: Vec<(usize, &str)> = vec![
+        (0, "nsdb0"),
+        (1, "one"),
+        (2, &ds),
+        (3, "scott"),
+        (4, "tiger"),
+        (5, "1"),
+        (6, "0"),
+        (7, "1"),
+        (8, "1"),
+        (9, "expected boolean value but got \"maybe\""),
+        (10, "2"),
+        (11, "x;y"),
+        (12, "it's"),
+        (13, "1"),
+        (
+            14,
+            "Database operation \"interpretsqlfile\" failed (exception NSINT, \"File ends with unterminated SQL\")",
+        ),
+        (15, "1"),
+        (16, "1"),
+        (
+            18,
+            "Database operation \"interpretsqlfile\" failed (exception NSINT, \"Could not read file\")",
+        ),
+        (19, "2"),
+        (20, "1"),
+        (
+            21,
+            "Database operation \"select\" failed (exception NSDB, \"Query was not a statement returning rows.\")",
+        ),
+        (22, "1"),
+        (
+            23,
+            "Database operation \"dml\" failed (exception NSDB, \"Query was not a DML or DDL command.\")",
+        ),
+        (24, "NSDB {Query was not a DML or DDL command.}"),
+        (25, "NSDB"),
+        (26, "Query was not a DML or DDL command."),
+        (27, "1"),
+        (
+            28,
+            "Database operation \"1row\" failed (exception NSINT, \"Query did not return a row.\")",
+        ),
+        (29, "1"),
+        (
+            30,
+            "Database operation \"0or1row\" failed (exception NSINT, \"Query returned more than one row.\")",
+        ),
+        (31, "1"),
+        (32, "{} {}"),
+        (33, "1"),
+        (34, "no such set: nosuchset"),
+        (35, "1"),
+        (36, "1"),
+        (37, "1"),
+        (38, "0"),
+        (39, "1"),
+        (40, "1"),
+        (41, "0"),
+        (42, "1"),
+        (43, "42000 {my message}"),
+        (44, "1"),
+        (45, "code \"123456\" more than 5 characters"),
+        (46, "1"),
+        (48, "1"),
+        (49, "could not allocate 1 handle(s) from pool \"one\""),
+        (50, "1"),
+        (51, "invalid nhandles:  \"0\": should be greater than 0."),
+        (52, "1"),
+        (53, "could not allocate 2 handle(s) from pool \"one\""),
+        (54, "1"),
+        (
+            55,
+            "wrong # args: should be \"ns_db gethandle ?-timeout seconds? ?pool? ?nhandles?\"",
+        ),
+        (56, "1"),
+        (57, "expected integer but got \"x\""),
+        (58, ""),
+        (59, "invalid database id:  \"nsdb0\""),
+        (60, "invalid database id:  \"nsdb0\""),
+        (61, "one"),
+        (62, "nsdb0"),
+        (63, "1"),
+        (64, "no access to pool: \"hidden\""),
+        (65, "1"),
+        (66, "no access to pool: \"nosuch\""),
+        (67, "1"),
+        (68, "Database operation \"bouncepool\" failed"),
+        (69, ""),
+        (70, "H"),
+        (71, ""),
+        (72, "0"),
+        (73, ""),
+        (74, "1"),
+        (75, "Database operation \"select\" failed"),
+        (76, "1"),
+        (77, "Database operation \"flush\" failed"),
+        (78, "1"),
+        (79, "invalid database id:  \"nsdb0\""),
+        (80, "nsdb0"),
+        (81, "2"),
+        (82, "a b {c d}"),
+        (83, "it s"),
+        (84, "a ,b"),
+        (85, "4"),
+        (86, "a b {c } {}"),
+        (87, "0"),
+        (88, ""),
+        (89, "-1"),
+        (90, ""),
+        (91, "1"),
+        (92, "wrong # args: should be \"ns_db select dbId arg\""),
+        (93, "1"),
+        (94, "wrong # args: should be \"ns_db releasehandle dbId\""),
+    ];
+    for (idx, w) in want {
+        assert_eq!(
+            items.get(idx).map(String::as_str),
+            Some(w),
+            "item {idx} in {items:?}\n{log:?}"
+        );
+    }
+    assert!(items[47].contains("not supported"), "{}", items[47]);
+    assert_eq!(items.len(), 95, "{items:?}");
     let log = log.join("\n");
     for want in [
         "no such driver: bogus",
         "no driver for pool 'nodrv'",
         "no such driver 'nosuch' for pool 'baddrv'",
         "missing datasource for pool 'nods'",
-        "dbinit: sql(one):",
-        "dbinit: error(one):",
+        &format!("dbinit: sql({ds}): 'select count(*) as n from s'"),
+        &format!("dbinit: error({ds},"),
+        "dbinit: db handle limit exceeded: thread already owns 1 handle from pool 'one'",
+        "dbinit: failed to get 2 handles from a db pool of only 1 handles: 'one'",
+        &format!("dbdrv: opening database 'sqlite:{ds}'"),
     ] {
         assert!(log.contains(want), "missing {want:?} in {log}");
+    }
+}
+
+#[test]
+fn nsdb_pools_belong_to_each_server_instance() {
+    // Each server reads its own pools, even when a new `Global` reuses
+    // the address of one that was shut down.
+    for i in 0..4 {
+        let extra = format!(
+            "ns_section ns/db/pools\nns_param pool{i} P{i}\n\
+             ns_section ns/db/pool/pool{i}\nns_param driver sqlite\nns_param datasource :memory:\n\
+             ns_section ns/server/s1/db\nns_param pools *"
+        );
+        let srv = boot("ns_param nsdb nsdb.so", &extra, |h| {
+            let lib = h.join("servers/s1/modules/tcl");
+            std::fs::create_dir_all(&lib).unwrap();
+            std::fs::write(
+                lib.join("p.tcl"),
+                "ns_register_proc GET /p p_proc\nproc p_proc {} {ns_return 200 text/plain [ns_db pools]}\n",
+            )
+            .unwrap();
+        });
+        let r = request(srv.port, "GET /p HTTP/1.0\r\n\r\n");
+        let want = format!("pool{i}");
+        assert_eq!(r.split("\r\n\r\n").nth(1), Some(want.as_str()), "{r}");
+        drop(srv);
     }
 }

@@ -114,6 +114,21 @@ Modules:
     but have no effect; `-evaltimeout` and `-waittimeout` behave as in
     AOLserver.
 
+nsdb:
+
+20 (nsdb). A handle reconnected after `ns_db bouncepool` counts as current.
+    AOLserver never updated a reconnected handle's bounce count, so a
+    handle that was in use during a bounce was closed again on every later
+    return to the pool.
+21 (nsdb). `ns_db` subcommands given the wrong number of arguments raise
+    the "wrong # args" error.  For the handle subcommands (`select`,
+    `releasehandle`, ...) AOLserver set that message but returned `TCL_OK`.
+22 (nsdb). Deleting an interp returns the handles it still holds to their
+    pools (AOLserver's `FreeData` dropped them, shrinking the pool).  The
+    SQLite driver treats a statement of only whitespace or comments (for
+    example between two `;` in `interpretsqlfile`) as an empty DML command,
+    and reports errors without a SQLite code as exception `NSDB`.
+
 ## Not yet supported (phase 2)
 
 These commands exist but return a clear `not supported` error:
