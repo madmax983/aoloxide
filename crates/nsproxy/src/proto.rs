@@ -7,9 +7,16 @@
 
 use std::io::{self, Read, Write};
 
+/// Largest message either side accepts.  A corrupt length prefix fails
+/// before anything is allocated.
+pub const MAX_MSG: usize = 256 << 20;
+
 /// Write one message.
 pub fn write_msg(w: &mut dyn Write, data: &[u8]) -> io::Result<()> {
-    let n = u32::try_from(data.len()).map_err(|_| io::Error::other("message too large"))?;
+    let n = u32::try_from(data.len())
+        .ok()
+        .filter(|&n| n as usize <= MAX_MSG)
+        .ok_or_else(|| io::Error::other("message too large"))?;
     w.write_all(&n.to_be_bytes())?;
     w.write_all(data)
 }
@@ -22,7 +29,14 @@ pub fn read_msg(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    let mut buf = vec![0u8; u32::from_be_bytes(len) as usize];
+    let n = u32::from_be_bytes(len) as usize;
+    if n > MAX_MSG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("message length {n} exceeds {MAX_MSG}"),
+        ));
+    }
+    let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)?;
     Ok(Some(buf))
 }
@@ -106,5 +120,16 @@ mod tests {
         assert_eq!(read_msg(&mut rd).expect("eof"), None);
         let mut short: &[u8] = &[0, 0, 0, 5, b'a'];
         assert!(read_msg(&mut short).is_err());
+    }
+
+    #[test]
+    fn oversized_length_is_rejected() {
+        // Stray script output ("hell") read as a length prefix.
+        let mut garbage: &[u8] = b"hello\n";
+        let e = read_msg(&mut garbage).expect_err("too large");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let len = u32::try_from(MAX_MSG + 1).expect("fits").to_be_bytes();
+        let mut over: &[u8] = &len;
+        assert!(read_msg(&mut over).is_err());
     }
 }

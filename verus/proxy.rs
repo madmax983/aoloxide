@@ -9,8 +9,20 @@
 //! * `avail + out == max` (no handle is lost or invented),
 //! * `free <= max(avail, 0)` (idle workers never exceed spare capacity),
 //!
-//! that a successful `get` never pushes `out` past `max`, that a failed
-//! `get` restores the pool exactly, and that each proxy moves only along
+//! Each transition is one critical section under the pool lock: `pop`
+//! (one handle taken by `pop_proxies`), `put` (one handle returned by
+//! `put_proxy`, or by `give_back` after a failed `get`) and `config`.
+//! The lock is dropped between them (condition waits, and `check` runs
+//! unlocked), so any interleaving of these steps is a real execution, and
+//! since each preserves the invariant, so does every interleaving.  In
+//! particular a `config` that lowers `-max` between a `get`'s pops and its
+//! `give_back` cannot leave idle workers beyond capacity, because
+//! `give_back` frees a proxy, as `put_proxy` does, when no capacity is
+//! left.
+//!
+//! We also prove that a successful `get` never pushes `out` past `max`,
+//! that a failed `get` with no concurrent `config` restores `avail` and
+//! `out` exactly, and that each proxy moves only along
 //! `Idle -send-> Busy -wait-> Done -recv-> Idle` (or back to `Idle` by
 //! `reset`, which closes the worker).
 
@@ -59,10 +71,13 @@ pub open spec fn put(p: Pool) -> Pool {
     }
 }
 
-/// `give_back`: a failed `get` returns the `n` proxies it took to the
-/// free list.
-pub open spec fn give_back(p: Pool, n: int) -> Pool {
-    Pool { max: p.max, avail: p.avail + n, out: p.out - n, free: p.free + n }
+/// `give_back`: a failed `get` returns the `n` proxies it took, one at a
+/// time, each exactly as `put_proxy` would (kept only while capacity
+/// remains).
+pub open spec fn give_back(p: Pool, n: nat) -> Pool
+    decreases n,
+{
+    if n == 0 { p } else { give_back(put(p), (n - 1) as nat) }
 }
 
 /// `config_cmd`: `nrun = max - avail`; set the new max; `avail = max -
@@ -101,6 +116,24 @@ pub proof fn config_preserves(p: Pool, new_max: int)
 {
 }
 
+/// Giving back `n` checked-out handles preserves the invariant.
+pub proof fn lemma_give_back(p: Pool, n: nat)
+    requires
+        inv(p),
+        p.out >= n,
+    ensures
+        inv(give_back(p, n)),
+        give_back(p, n).avail == p.avail + n,
+        give_back(p, n).out == p.out - n,
+        give_back(p, n).max == p.max,
+    decreases n,
+{
+    if n > 0 {
+        put_preserves(p);
+        lemma_give_back(put(p), (n - 1) as nat);
+    }
+}
+
 /// Taking `n` handles and then giving them back after a failed check
 /// restores the accounting (the free list may hold more live workers,
 /// never more than the spare capacity).
@@ -109,11 +142,29 @@ pub proof fn failed_get_restores(p: Pool, n: nat)
         inv(p),
         p.avail >= n,
     ensures
-        inv(give_back(pop_n(p, n), n as int)),
-        give_back(pop_n(p, n), n as int).avail == p.avail,
-        give_back(pop_n(p, n), n as int).out == p.out,
+        inv(give_back(pop_n(p, n), n)),
+        give_back(pop_n(p, n), n).avail == p.avail,
+        give_back(pop_n(p, n), n).out == p.out,
 {
     lemma_pop_n(p, n);
+    lemma_give_back(pop_n(p, n), n);
+}
+
+/// The unlocked `check` window: a `config` (possibly lowering `-max`
+/// below the handles in use) between a `get`'s pops and its `give_back`
+/// still leaves the pool satisfying the invariant.
+pub proof fn failed_get_with_config_between(p: Pool, n: nat, new_max: int)
+    requires
+        inv(p),
+        p.avail >= n,
+        new_max >= 0,
+    ensures
+        inv(give_back(config(pop_n(p, n), new_max), n)),
+        give_back(config(pop_n(p, n), new_max), n).max == new_max,
+{
+    lemma_pop_n(p, n);
+    config_preserves(pop_n(p, n), new_max);
+    lemma_give_back(config(pop_n(p, n), new_max), n);
 }
 
 pub open spec fn pop_n(p: Pool, n: nat) -> Pool

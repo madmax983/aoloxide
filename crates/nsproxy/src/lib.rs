@@ -33,6 +33,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -170,6 +171,7 @@ struct Worker {
     stdin: Option<BufWriter<ChildStdin>>,
     replies: Receiver<Option<proto::Reply>>,
     linger: Duration,
+    pool: String,
 }
 
 impl Worker {
@@ -178,7 +180,7 @@ impl Worker {
             .args([pool, id])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| e.to_string())?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
@@ -200,6 +202,7 @@ impl Worker {
             stdin: Some(BufWriter::new(stdin)),
             replies: rx,
             linger: Duration::from_millis(cfg.wait_timeout),
+            pool: pool.to_owned(),
         })
     }
 
@@ -214,25 +217,93 @@ impl Worker {
 }
 
 impl Drop for Worker {
-    /// `Close` + `CloseThread`: close the worker's stdin so it exits, then
-    /// kill it if it is still running after `-waittimeout`.
+    /// `Close`: close the worker's stdin so it exits, and hand the process
+    /// to a background thread that reaps it (`CloseThread`).
     fn drop(&mut self) {
         drop(self.stdin.take());
         if let Some(mut child) = self.child.take() {
-            let linger = self.linger;
+            let (linger, pool) = (self.linger, std::mem::take(&mut self.pool));
             std::thread::spawn(move || {
-                let deadline = Instant::now() + linger;
-                while Instant::now() < deadline {
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                let _ = child.kill();
-                let _ = child.wait();
+                reap(&mut child, linger, &pool);
             });
         }
     }
+}
+
+/// How [`reap`] disposed of a closing worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reaped {
+    /// Exited within `-waittimeout` of its stdin closing.
+    Exited,
+    /// Exited after `SIGTERM`.
+    Terminated,
+    /// Exited after `SIGKILL`.
+    Killed,
+    /// Still running after `SIGKILL`; left unreaped.
+    Zombie,
+}
+
+/// The server log of the process, once the module is loaded.
+static LOG_GLOBAL: Mutex<Option<std::sync::Weak<nsd::Global>>> = Mutex::new(None);
+
+/// `Ns_Log(Warning, ...)`: the server log if reachable, else stderr.
+fn warn(msg: &str) {
+    let g = lock(&LOG_GLOBAL)
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade);
+    match g {
+        Some(g) => g.log(ns_core::log::Severity::Warning, msg),
+        None => eprintln!("Warning: {msg}"),
+    }
+}
+
+/// Wait up to `ms` for `child` to exit (`WaitFd` on the result pipe).
+fn exited_within(child: &mut Child, ms: Duration) -> bool {
+    let deadline = Instant::now() + ms;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// `Kill`: log and signal a worker that won't die.
+fn kill_worker(child: &mut Child, pool: &str, sig: i32) {
+    warn(&format!(
+        "[{pool}]: process {} won't die - sending sig {sig}",
+        child.id()
+    ));
+    if sig == libc::SIGKILL {
+        let _ = child.kill();
+    } else if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: kill(2) with a pid we spawned and have not yet reaped.
+        unsafe {
+            libc::kill(pid, sig);
+        }
+    }
+}
+
+/// `CloseThread`: give a closing worker `linger` to exit, then `SIGTERM`
+/// it, then `SIGKILL` it, waiting `linger` after each; a worker that
+/// survives even that is logged as a zombie.
+fn reap(child: &mut Child, linger: Duration, pool: &str) -> Reaped {
+    if exited_within(child, linger) {
+        return Reaped::Exited;
+    }
+    kill_worker(child, pool, libc::SIGTERM);
+    if exited_within(child, linger) {
+        return Reaped::Terminated;
+    }
+    kill_worker(child, pool, libc::SIGKILL);
+    if exited_within(child, linger) {
+        return Reaped::Killed;
+    }
+    warn(&format!("zombie: {}", child.id()));
+    Reaped::Zombie
 }
 
 /// Proxy evaluation state.
@@ -425,12 +496,18 @@ impl Proxy {
         self.recv()
     }
 
+    /// `Close` after a failed check: reset (dropping any `active` entry
+    /// and returning to `Idle`) and close the worker even if it is idle.
+    fn close(&mut self) {
+        self.reset();
+        self.worker = None;
+    }
+
     /// `Check`: ping a live worker (restarting it if the ping fails), or
     /// start one and run the pool's `-init` script.
     fn check(&mut self) -> Result<(), Exception> {
         if self.worker.is_some() && self.eval(None, None).is_err() {
-            self.worker = None;
-            self.state = State::Idle;
+            self.close();
         }
         if self.worker.is_none() {
             let cfg = self.cfg();
@@ -440,8 +517,7 @@ impl Proxy {
             }
             if let Some(init) = &cfg.init {
                 if self.eval(Some(init), None).is_err() {
-                    self.worker = None;
-                    self.state = State::Idle;
+                    self.close();
                     return Err(ProxyErr::Init.exception("", None));
                 }
             }
@@ -528,13 +604,14 @@ pub fn cleanup(interp: &dyn Interp) {
 }
 
 /// `PopProxy` loop of `GetObjCmd`: wait to be the exclusive waiter, then
-/// take `nwant` proxies.
+/// take `nwant` proxies.  On failure, also returns how many were still
+/// wanted (C's `nwant`, which picks "handle" or "handles").
 fn pop_proxies(
     pool: &Arc<Pool>,
     nhave: usize,
     nwant: usize,
     ms: u64,
-) -> Result<Vec<Proxy>, ProxyErr> {
+) -> Result<Vec<Proxy>, (ProxyErr, usize)> {
     let deadline = Instant::now() + Duration::from_millis(ms);
     let mut inner = lock(&pool.inner);
     let (mut nhave, mut nwant, mut waiter) = (nhave, nwant, false);
@@ -612,23 +689,31 @@ fn pop_proxies(
     if waiter {
         inner.waiting = false;
     }
-    let out = match err {
-        None => Ok(got),
-        Some(e) => {
-            give_back(&mut inner, got);
-            Err(e)
-        }
+    let (out, dropped) = match err {
+        None => (Ok(got), Vec::new()),
+        Some(e) => (Err((e, nwant)), give_back(&mut inner, got)),
     };
     drop(inner);
+    drop(dropped);
     pool.cond.notify_all();
     out
 }
 
-fn give_back(inner: &mut PoolInner, got: Vec<Proxy>) {
+/// A failed `get` returns the proxies it took, front first.  Like
+/// `put_proxy`, a proxy goes back on the free list only while capacity
+/// remains (`-max` may have been lowered while the lock was dropped for
+/// `check`); the rest are returned for the caller to free outside the lock.
+fn give_back(inner: &mut PoolInner, got: Vec<Proxy>) -> Vec<Proxy> {
+    let mut dropped = Vec::new();
     for p in got.into_iter().rev() {
-        inner.free.push_front(p);
         inner.avail += 1;
+        if inner.avail > 0 {
+            inner.free.push_front(p);
+        } else {
+            dropped.push(p);
+        }
     }
+    dropped
 }
 
 fn get_cmd(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
@@ -645,9 +730,10 @@ fn get_cmd(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         let flag = ns_script::get_index(&kv[0], &flags, "flags")?;
         let n = nsd::cmds::int_arg(&kv[1])?;
         let Ok(n) = u64::try_from(n) else {
+            // As in C, which prints `objv[2]`: the pool name.
             return Err(Exception::error(format!(
                 "invalid {}: {}",
-                flags[flag], kv[1]
+                flags[flag], argv[2]
             )));
         };
         if flag == 0 {
@@ -666,8 +752,8 @@ fn get_cmd(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         );
         Exception { message: msg, ..e }
     };
-    let mut got =
-        pop_proxies(&pool, nhave, nwant, ms).map_err(|e| fail(e.exception("", None), nwant))?;
+    let mut got = pop_proxies(&pool, nhave, nwant, ms)
+        .map_err(|(e, left)| fail(e.exception("", None), left))?;
     // Check (ping or start) each proxy outside the pool lock.
     let mut bad = None;
     for p in &mut got {
@@ -677,9 +763,11 @@ fn get_cmd(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         }
     }
     if let Some(e) = bad {
-        give_back(&mut lock(&pool.inner), got);
+        let dropped = give_back(&mut lock(&pool.inner), got);
+        drop(dropped);
         pool.cond.notify_all();
-        return Err(fail(e, nwant));
+        // Every handle was taken, so C's remaining `nwant` is 0.
+        return Err(fail(e, 0));
     }
     let mut d = data.borrow_mut();
     *d.cnts.entry(pool.name.clone()).or_default() += got.len();
@@ -698,7 +786,7 @@ fn config_cmd(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         "-min",
         "-max",
         "-exec",
-        "-gettimeout",
+        "-getimeout",
         "-evaltimeout",
         "-sendtimeout",
         "-recvtimeout",
@@ -712,7 +800,13 @@ fn config_cmd(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     let max = i64::try_from(inner.cfg.max).unwrap_or(i64::MAX);
     let nrun = max - inner.avail;
     for kv in argv[3..].chunks(2) {
-        let (flag, v) = (ns_script::get_index(&kv[0], &FLAGS, "flags")?, &kv[1]);
+        // `-gettimeout` is accepted as an alias of C's `-getimeout`.
+        let flag = if kv[0] == "-gettimeout" {
+            5
+        } else {
+            ns_script::get_index(&kv[0], &FLAGS, "flags")?
+        };
+        let v = &kv[1];
         let set_opt = |v: &str| (!v.is_empty()).then(|| v.to_owned());
         match flag {
             0 => inner.cfg.init = set_opt(v),
@@ -757,7 +851,7 @@ fn config_cmd(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         c.max.to_string(),
         "-min".into(),
         c.min.to_string(),
-        "-gettimeout".into(),
+        "-getimeout".into(),
         c.get_timeout.to_string(),
         "-evaltimeout".into(),
         c.eval_timeout.to_string(),
@@ -859,14 +953,48 @@ pub fn ns_proxy(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     }
 }
 
-/// The worker process main loop (`Ns_ProxyMain`): read scripts from stdin,
-/// evaluate them in a fresh interp, write replies to stdout.
+/// Move the protocol off fds 0 and 1 (`Ns_ProxyMain`) "to avoid protocol
+/// errors with scripts accessing stdin and stdout": the pipes are
+/// duplicated to private descriptors, stdin is reopened on `/dev/null` and
+/// stdout becomes a copy of stderr.  The private descriptors are
+/// close-on-exec so commands a script `exec`s cannot hold the pipes open.
+fn private_stdio() -> std::io::Result<(File, File)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let dup = |fd: i32| -> std::io::Result<OwnedFd> {
+        // SAFETY: fcntl on a descriptor number; the result, if valid, is a
+        // new descriptor we own.
+        let n = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `n` is a freshly created descriptor owned by nobody else.
+        Ok(unsafe { OwnedFd::from_raw_fd(n) })
+    };
+    let (rfd, wfd) = (dup(0)?, dup(1)?);
+    let null = std::fs::File::open("/dev/null")?;
+    // SAFETY: dup2 onto the standard descriptors, which this process owns;
+    // `null` and fd 2 are valid for the duration of the calls.
+    unsafe {
+        if libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&null), 0) < 0 || libc::dup2(2, 1) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok((File::from(rfd), File::from(wfd)))
+}
+
+/// The worker process main loop (`Ns_ProxyMain`): read scripts from the
+/// server, evaluate them in an interp with the core commands
+/// (`Ns_TclCreateInterp`), write the replies back.
 pub fn worker_main(engine: &dyn ns_script::ScriptEngine) -> i32 {
+    let Ok((rfd, wfd)) = private_stdio() else {
+        return 1;
+    };
     let Ok(interp) = engine.create_interp() else {
         return 1;
     };
-    let mut input = BufReader::new(std::io::stdin().lock());
-    let mut output = BufWriter::new(std::io::stdout().lock());
+    nsd::interp::init_bare(&*interp);
+    let mut input = BufReader::new(rfd);
+    let mut output = BufWriter::new(wfd);
     while let Ok(Some(script)) = proto::read_msg(&mut input) {
         let script = String::from_utf8_lossy(&script);
         let reply = if script.is_empty() {
@@ -915,6 +1043,7 @@ pub fn init(ctx: &ModuleContext<'_>) -> Result<(), NsError> {
     let server = ctx
         .server
         .ok_or_else(|| NsError::Config("nsproxy must be loaded as a per-server module".into()))?;
+    *lock(&LOG_GLOBAL) = Some(Arc::downgrade(ctx.global));
     server.add_command("ns_proxy", command(ns_proxy));
     nsd::interp::register_trace(
         server,
@@ -930,6 +1059,64 @@ pub fn init(ctx: &ModuleContext<'_>) -> Result<(), NsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn bare_proxy(pool: &Arc<Pool>, id: &str) -> Proxy {
+        Proxy {
+            id: id.to_owned(),
+            pool: Arc::clone(pool),
+            worker: None,
+            state: State::Idle,
+            script: String::new(),
+            reply: None,
+        }
+    }
+
+    #[test]
+    fn give_back_frees_proxies_beyond_capacity() {
+        let pool = get_pool("unit-give-back");
+        let mut inner = lock(&pool.inner);
+        // Two proxies were taken, then `-max` was lowered under them.
+        inner.avail = -1;
+        let got = vec![bare_proxy(&pool, "a"), bare_proxy(&pool, "b")];
+        let dropped = give_back(&mut inner, got);
+        assert_eq!(inner.avail, 1);
+        // "b" brings avail to 0 and is freed; "a" brings it to 1 and stays.
+        let free: Vec<&str> = inner.free.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(free, ["a"]);
+        assert_eq!(
+            dropped.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+        // With capacity, every proxy goes back in its original order.
+        inner.free.clear();
+        inner.avail = 0;
+        let got = vec![bare_proxy(&pool, "c"), bare_proxy(&pool, "d")];
+        assert!(give_back(&mut inner, got).is_empty());
+        let free: Vec<&str> = inner.free.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!((free, inner.avail), (vec!["c", "d"], 2));
+        inner.free.clear();
+    }
+
+    fn spawn(script: &str) -> Child {
+        Command::new("/bin/sh")
+            .args(["-c", script])
+            .spawn()
+            .expect("spawn sh")
+    }
+
+    #[test]
+    fn reap_escalates_from_sigterm_to_sigkill() {
+        let ms = Duration::from_millis;
+        let mut c = spawn("exit 0");
+        assert_eq!(reap(&mut c, ms(2000), "p"), Reaped::Exited);
+        let mut c = spawn("exec sleep 30");
+        assert_eq!(reap(&mut c, ms(50), "p"), Reaped::Terminated);
+        assert_eq!(c.wait().expect("status").signal(), Some(libc::SIGTERM));
+        let mut c = spawn("trap '' TERM; exec sleep 30");
+        assert_eq!(reap(&mut c, ms(50), "p"), Reaped::Killed);
+        assert_eq!(c.wait().expect("status").signal(), Some(libc::SIGKILL));
+    }
 
     #[test]
     fn error_codes_match_aolserver() {

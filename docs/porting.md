@@ -154,6 +154,25 @@ nsdb:
     example between two `;` in `interpretsqlfile`) as an empty DML command,
     and reports errors without a SQLite code as exception `NSDB`.
 
+nsproxy:
+
+20 (nsproxy). `ns_proxy config` accepts `-gettimeout` as an alias of
+    AOLserver's `-getimeout` (the flag reported back is `-getimeout`).
+21 (nsproxy). A failed `ns_proxy get` returns its proxies the way
+    `ns_proxy release` does: a proxy whose return leaves no spare capacity
+    (`-max` was lowered while the handles were being checked) is freed
+    rather than put on the free list, so idle workers never exceed the
+    spare capacity (proved in `verus/proxy.rs`).  AOLserver put them all
+    back on the free list.
+22 (nsproxy). When the ping or `-init` script of a handle being checked
+    out fails, the proxy is reset to idle with its worker closed.
+    AOLserver left a timed-out proxy marked busy, so the replacement
+    worker's `-init` (or the caller's first `eval`) failed with `EBusy`.
+23 (nsproxy). Protocol messages are capped at 256 MiB, and the worker's
+    private protocol descriptors are close-on-exec.  A closing worker is
+    reaped by polling for its exit rather than for EOF on its result pipe;
+    the `SIGTERM`/`SIGKILL` sequence and its warnings match AOLserver.
+
 ## Not yet supported (phase 2)
 
 These commands exist but return a clear `not supported` error:
@@ -182,7 +201,7 @@ the tokio runtime, and channel transfer for `ns_chan`.
 | `glob.rs` | an executable `*`/`?` matcher equals the recursive spec; literal and `*` lemmas |
 | `pool.rs` | pool transitions keep `idle ≤ current ≤ max`; enqueue never strands work while there is capacity |
 | `cache.rs` | inserts keep total size ≤ max; eviction removes only LRU entries |
-| `proxy.rs` | nsproxy handle accounting (`avail + out = max`, idle workers ≤ spare capacity, failed `get` restores the pool) and the `Idle → Busy → Done → Idle` proxy state machine |
+| `proxy.rs` | nsproxy handle accounting (`avail + out = max`, idle workers ≤ spare capacity under any interleaving of get, release and config, including a config between a failed `get`'s pops and its give-back; a failed `get` restores the pool) and the `Idle → Busy → Done → Idle` proxy state machine |
 
 The production implementations are additionally checked against the same
 specifications by property tests (`proptest`).
