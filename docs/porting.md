@@ -114,6 +114,22 @@ Modules:
     but have no effect; `-evaltimeout` and `-waittimeout` behave as in
     AOLserver.
 
+nscp:
+
+20 (nscp). The control port parses input as a byte stream, not per
+    `recv()` chunk as `GetLine` does.  `IAC EOF`, `IAC IP`, a line that
+    starts with EOT (Ctrl-D) and end of input (even after a partial line)
+    still end the session, and any other telnet command still logs
+    "unsupported telnet IAC code received from client" and ends it.  The
+    differences: telnet commands are recognised anywhere in the input, not
+    only at the start of a chunk, and option negotiation (`IAC
+    WILL|WONT|DO|DONT opt`) is always skipped.  AOLserver tolerated only
+    up to two `IAC WONT` replies per line, and flushed the client's replies
+    to the password prompt's echo negotiation with a blocking `recv()`; a
+    client that sent its password at once lost it to that flush.  Each
+    line is read up to `\n` (CR and NUL bytes are dropped), so several
+    lines arriving in one packet are evaluated one command at a time.
+
 ## Not yet supported (phase 2)
 
 These commands exist but return a clear `not supported` error:
