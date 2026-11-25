@@ -1,0 +1,21 @@
+[package]
+name = "nsdb"
+description = "AOLserver nsdb module: database pools, handles and ns_db, with a SQLite driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nsd = { path = "../nsd" }
+ns-core = { path = "../ns-core" }
+ns-script = { path = "../ns-script" }
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

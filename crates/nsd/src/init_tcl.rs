@@ -1,8 +1,8 @@
 //! The AOLserver Tcl library, embedded so a server home can be created
 //! with [`install_home`] and so a missing `bin/init.tcl` still boots.
 //!
-//! These files are AOLserver's own Tcl sources (MPL 1.1, see
-//! `LICENSE-AOLSERVER`), shipped unchanged.
+//! These files are AOLserver's own Tcl sources (MPL 1.1, see `LICENSE`),
+//! shipped unchanged.
 
 use std::io;
 use std::path::Path;
