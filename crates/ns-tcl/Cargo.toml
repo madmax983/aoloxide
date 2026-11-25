@@ -1,0 +1,16 @@
+[package]
+name = "ns-tcl"
+description = "Tcl 8.6 scripting engine (libtcl FFI) for the AOLserver port"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+links = "tcl8.6"
+build = "build.rs"
+
+[dependencies]
+ns-script = { path = "../ns-script" }
+
+[lints]
+workspace = true

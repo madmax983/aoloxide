@@ -207,6 +207,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ns-script"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "ns-tcl"
+version = "0.1.0"
+dependencies = [
+ "ns-script",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
