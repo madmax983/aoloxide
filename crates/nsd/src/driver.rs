@@ -1,13 +1,19 @@
 //! The socket driver (`nsd/driver.c`, the `nssock` module).
 //!
 //! Each driver listens on one address.  For every accepted socket an async
-//! task reads the request ahead (request line, headers and body, within the
-//! `maxline`/`maxheader`/`maxinput` limits), then hands it to the virtual
-//! server's connection queue and waits for the connection thread to give
+//! task reads the request ahead (request line and headers within the
+//! `maxline`/`maxheader` limits, then the body), then hands it to the
+//! virtual server's connection queue and waits for the connection thread to give
 //! the socket back.  If the response allowed keep-alive, the task waits up
 //! to `keepwait` for the next request; otherwise it closes gracefully,
 //! draining input for up to `closewait`.  See
 //! `docs/adr/0003-threading-model.md`.
+//!
+//! As in `SockReadLine`, a body longer than the request's `ns_limits`
+//! `maxupload` is refused (413) before it is read.  A body whose request
+//! (line, headers, body and a trailing CRLF) reaches `maxinput` is spooled
+//! to a temp file ([`crate::content::get_temp`]) as it arrives instead of
+//! being buffered; the accounting is modelled in `verus/spool.rs`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -25,7 +31,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch, Semaphore};
 
+use crate::content::{get_temp, Content, TempFile};
 use crate::global::{Global, NsError};
+use crate::pool::Limits;
 use crate::server::Server;
 
 /// A client byte stream (plain TCP or TLS).
@@ -99,7 +107,8 @@ pub struct DriverInfo {
     pub maxline: usize,
     /// Max total header bytes.
     pub maxheader: usize,
-    /// Max request body bytes held in memory.
+    /// Max bytes of a request (line, headers and body) held in memory;
+    /// larger bodies are spooled to a temp file.
     pub maxinput: usize,
     /// Max open sockets.
     pub maxsock: usize,
@@ -228,8 +237,8 @@ pub struct Incoming {
     pub request: Request,
     /// Request headers (case preserved).
     pub headers: NsSet,
-    /// Request body.
-    pub content: Vec<u8>,
+    /// Request body, in memory or spooled.
+    pub content: Content,
     /// Client address.
     pub peer: SocketAddr,
     /// Accepting driver.
@@ -268,6 +277,103 @@ enum ReadError {
     Timeout,
     Io,
     Status(u16),
+    /// The body could not be spooled (`E_FDAGAIN`, `E_FDWRITE`, ...).
+    Spool(io::Error),
+}
+
+impl From<io::Error> for ReadError {
+    fn from(e: io::Error) -> Self {
+        Self::Spool(e)
+    }
+}
+
+/// A request body as it is read ahead: buffered in memory or spooled to a
+/// temp file (`connPtr->content` / `connPtr->tfd`).  `mem.len() + disk`
+/// is the bytes read so far (`connPtr->avail`); see `verus/spool.rs`.
+struct Body {
+    mem: Vec<u8>,
+    file: Option<TempFile>,
+    disk: usize,
+}
+
+impl Body {
+    /// An in-memory body expecting about `capacity` bytes.
+    fn memory(capacity: usize) -> Self {
+        Self {
+            mem: Vec::with_capacity(capacity),
+            file: None,
+            disk: 0,
+        }
+    }
+
+    /// A body spooled to a new temp file.
+    fn spooled() -> io::Result<Self> {
+        Ok(Self {
+            mem: Vec::new(),
+            file: Some(get_temp()?),
+            disk: 0,
+        })
+    }
+
+    /// Bytes read so far.
+    fn read(&self) -> usize {
+        self.mem.len() + self.disk
+    }
+
+    const fn spooling(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// Store body bytes in the chosen sink.  Writes to the temp file are
+    /// short, buffered-cache writes of at most one read buffer, done in
+    /// place as `SockReadContent` does in the driver thread.
+    fn push(&mut self, data: &[u8]) -> io::Result<()> {
+        match &mut self.file {
+            Some(f) => {
+                std::io::Write::write_all(f.file_mut(), data)?;
+                self.disk += data.len();
+            }
+            None => self.mem.extend_from_slice(data),
+        }
+        Ok(())
+    }
+
+    /// Move a growing in-memory body to a temp file (chunked bodies).
+    fn spill(&mut self) -> io::Result<()> {
+        let mut t = get_temp()?;
+        std::io::Write::write_all(t.file_mut(), &self.mem)?;
+        self.disk = self.mem.len();
+        self.mem = Vec::new();
+        self.file = Some(t);
+        Ok(())
+    }
+
+    /// The finished body, a spooled one rewound for reading.
+    fn finish(self) -> io::Result<Content> {
+        match self.file {
+            Some(mut f) => {
+                f.file_mut().set_len(self.disk as u64)?;
+                std::io::Seek::seek(f.file_mut(), std::io::SeekFrom::Start(0))?;
+                Ok(Content::spooled(f, self.disk))
+            }
+            None => Ok(Content::memory(self.mem)),
+        }
+    }
+}
+
+/// Move up to `need` bytes from the front of `buf` into `body`.  Returns
+/// the bytes taken (`take` in `verus/spool.rs`).
+fn take_body(buf: &mut Vec<u8>, body: &mut Body, need: usize) -> io::Result<usize> {
+    let n = need.min(buf.len());
+    body.push(&buf[..n])?;
+    buf.drain(..n);
+    Ok(n)
+}
+
+/// Whether a body of `len` bytes after `head` request bytes is spooled:
+/// `roff + contentLength + 2 >= maxinput` (room for a trailing CRLF).
+const fn spools(head: usize, len: usize, maxinput: usize) -> bool {
+    head.saturating_add(len).saturating_add(2) >= maxinput
 }
 
 fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
@@ -306,14 +412,18 @@ async fn read_more(
 struct ReadRequest {
     request: Request,
     headers: NsSet,
-    content: Vec<u8>,
+    content: Content,
 }
 
+/// Read one request.  `limits` gives the request's `ns_limits`
+/// (`NsGetRequestLimits`) once its line and headers are read; a body over
+/// their `maxupload` is refused and counted as dropped.
 async fn read_request(
     stream: &mut Box<dyn ConnStream>,
     buf: &mut Vec<u8>,
     info: &DriverInfo,
     first_wait: Duration,
+    limits: &(dyn Fn(&Request, &NsSet) -> Arc<Limits> + Send + Sync),
 ) -> Result<ReadRequest, ReadError> {
     let mut wait = first_wait;
     // Skip leading blank lines between pipelined requests.
@@ -377,18 +487,33 @@ async fn read_request(
     let expects_continue = headers
         .iget("expect")
         .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
-    let mut content = Vec::new();
+    let limits = limits(&request, &headers);
+    let maxupload = limits.config().maxupload;
+    let too_large = || {
+        limits.drop_upload();
+        ReadError::Status(413)
+    };
+    let mut body = Body::memory(0);
     if let Some(len) = length.filter(|_| !chunked) {
-        if len > info.maxinput {
-            return Err(ReadError::Status(413));
+        if len > maxupload {
+            return Err(too_large());
         }
         if expects_continue && buf.len() < len {
             let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
         }
-        while buf.len() < len {
+        body = if spools(body_start, len, info.maxinput) {
+            Body::spooled()?
+        } else {
+            Body::memory(len)
+        };
+        loop {
+            let owed = len - body.read();
+            take_body(buf, &mut body, owed)?;
+            if body.read() == len {
+                break;
+            }
             read_more(stream, buf, info.recvwait, info.bufsize).await?;
         }
-        content = buf.drain(..len).collect();
     } else if chunked {
         if expects_continue {
             let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
@@ -419,20 +544,30 @@ async fn read_request(
                 }
                 break;
             }
-            if content.len() + size > info.maxinput {
-                return Err(ReadError::Status(413));
+            if body.read().saturating_add(size) > maxupload {
+                return Err(too_large());
             }
-            while buf.len() < size + 2 {
+            if !body.spooling() && spools(body_start, body.read() + size, info.maxinput) {
+                body.spill()?;
+            }
+            let mut need = size;
+            loop {
+                need -= take_body(buf, &mut body, need)?;
+                if need == 0 {
+                    break;
+                }
                 read_more(stream, buf, info.recvwait, info.bufsize).await?;
             }
-            content.extend(buf.drain(..size));
+            while buf.len() < 2 {
+                read_more(stream, buf, info.recvwait, info.bufsize).await?;
+            }
             buf.drain(..2);
         }
     }
     Ok(ReadRequest {
         request,
         headers,
-        content,
+        content: body.finish()?,
     })
 }
 
@@ -596,8 +731,12 @@ impl Driver {
                 self.info.keepwait
             };
             first = false;
+            let limits = |req: &Request, headers: &NsSet| {
+                self.select_server(headers)
+                    .limits_for(&req.method, &req.url)
+            };
             let read = tokio::select! {
-                r = read_request(&mut stream, &mut buf, &self.info, wait) => r,
+                r = read_request(&mut stream, &mut buf, &self.info, wait, &limits) => r,
                 _ = stop.changed() => Err(ReadError::Eof),
             };
             let req = match read {
@@ -612,6 +751,14 @@ impl Driver {
                 }
                 Err(ReadError::Timeout) => {
                     self.info.stats.timeouts.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(ReadError::Spool(e)) => {
+                    self.global.log(
+                        Severity::Error,
+                        &format!("{}: could not spool request content: {e}", self.info.module),
+                    );
+                    self.info.stats.dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 Err(ReadError::Eof | ReadError::Io) => return,
@@ -739,13 +886,155 @@ mod tests {
     }
 
     async fn parse(input: &[u8], i: &DriverInfo) -> Result<(ReadRequest, Vec<u8>), ReadError> {
+        let limits = Limits::new("t", crate::pool::LimitsConfig::default());
+        parse_with(input, i, &limits, input.len().max(1)).await
+    }
+
+    /// Read a request sent in `piece`-byte writes under `limits`.
+    async fn parse_with(
+        input: &[u8],
+        i: &DriverInfo,
+        limits: &Arc<Limits>,
+        piece: usize,
+    ) -> Result<(ReadRequest, Vec<u8>), ReadError> {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
-        client.write_all(input).await.map_err(|_| ReadError::Io)?;
-        drop(client);
+        let data = input.to_vec();
+        let writer = tokio::spawn(async move {
+            for p in data.chunks(piece) {
+                if client.write_all(p).await.is_err() {
+                    break;
+                }
+            }
+        });
         let mut s: Box<dyn ConnStream> = Box::new(server);
         let mut buf = Vec::new();
-        let r = read_request(&mut s, &mut buf, i, Duration::from_secs(1)).await?;
-        Ok((r, buf))
+        let l = Arc::clone(limits);
+        let r = read_request(&mut s, &mut buf, i, Duration::from_secs(1), &move |_, _| {
+            Arc::clone(&l)
+        })
+        .await;
+        writer.abort();
+        Ok((r?, buf))
+    }
+
+    fn limits(maxupload: usize) -> Arc<Limits> {
+        Limits::new(
+            "t",
+            crate::pool::LimitsConfig {
+                maxupload,
+                ..crate::pool::LimitsConfig::default()
+            },
+        )
+    }
+
+    fn post(len: usize, body: &[u8]) -> Vec<u8> {
+        let mut v = format!("POST /up HTTP/1.1\r\nContent-Length: {len}\r\n\r\n").into_bytes();
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn small_bodies_stay_in_memory() {
+        let i = info();
+        let head = post(1000, b"").len();
+        // The largest body that, with its request and a CRLF, stays under
+        // maxinput.
+        let n = i.maxinput - head - 3;
+        let body = pattern(n);
+        let (r, _) = rt()
+            .block_on(parse_with(&post(n, &body), &i, &limits(1 << 20), 1000))
+            .expect("read");
+        assert!(!r.content.on_disk());
+        assert_eq!(r.content.bytes().expect("bytes"), &body[..]);
+    }
+
+    #[test]
+    fn large_bodies_are_spooled() {
+        let i = info();
+        let head = post(1000, b"").len();
+        let n = i.maxinput - head - 2;
+        assert!(spools(head, n, i.maxinput) && !spools(head, n - 1, i.maxinput));
+        for len in [n, 100_000] {
+            let body = pattern(len);
+            let mut input = post(len, &body);
+            input.extend_from_slice(b"GET /next HTTP/1.0\r\n\r\n");
+            let (r, left) = rt()
+                .block_on(parse_with(&input, &i, &limits(1 << 20), 777))
+                .expect("read");
+            assert!(spools(post(len, b"").len(), len, i.maxinput));
+            assert!(r.content.file_content(), "{len}");
+            assert_eq!(r.content.len(), len);
+            assert_eq!(r.content.read_at(0, len).expect("read"), body);
+            assert!(left.starts_with(b"GET /next"), "{len}");
+        }
+    }
+
+    #[test]
+    fn chunked_bodies_spill_to_disk() {
+        let i = info();
+        let mut input = b"POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        let body = pattern(9000);
+        for c in body.chunks(1500) {
+            input.extend_from_slice(format!("{:x}\r\n", c.len()).as_bytes());
+            input.extend_from_slice(c);
+            input.extend_from_slice(b"\r\n");
+        }
+        input.extend_from_slice(b"0\r\n\r\n");
+        let (r, _) = rt()
+            .block_on(parse_with(&input, &i, &limits(1 << 20), 333))
+            .expect("read");
+        assert!(r.content.file_content());
+        assert_eq!(r.content.to_vec(), body);
+        // Over maxupload: refused part-way, and counted as dropped.
+        let l = limits(4000);
+        assert!(matches!(
+            rt().block_on(parse_with(&input, &i, &l, 333)),
+            Err(ReadError::Status(413))
+        ));
+        assert_eq!(l.counters().ndropped, 1);
+    }
+
+    #[test]
+    fn maxupload_refuses_before_reading() {
+        let i = info();
+        let l = limits(10);
+        assert!(matches!(
+            rt().block_on(parse_with(&post(11, b""), &i, &l, 100)),
+            Err(ReadError::Status(413))
+        ));
+        assert_eq!(l.counters().ndropped, 1);
+        let (r, _) = rt()
+            .block_on(parse_with(&post(10, b"0123456789"), &i, &l, 100))
+            .expect("read");
+        assert_eq!(r.content.to_vec(), b"0123456789");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+        /// The read-ahead invariants of `verus/spool.rs`: the body is read
+        /// exactly, in the sink `spools` chooses, however it is split, and
+        /// pipelined bytes are left alone.
+        #[test]
+        fn read_ahead_accounting(len in 0usize..12_000, piece in 1usize..5000, extra in 0usize..64) {
+            let i = info();
+            let head = post(len, b"").len();
+            let body = pattern(len);
+            let mut input = post(len, &body);
+            input.extend(std::iter::repeat_n(b'x', extra));
+            let (r, left) = rt()
+                .block_on(parse_with(&input, &i, &limits(1 << 20), piece))
+                .expect("read");
+            proptest::prop_assert_eq!(r.content.on_disk(), spools(head, len, i.maxinput));
+            proptest::prop_assert_eq!(r.content.len(), len);
+            proptest::prop_assert_eq!(r.content.to_vec(), body);
+            proptest::prop_assert!(left.len() <= extra);
+            proptest::prop_assert!(left.iter().all(|&b| b == b'x'));
+        }
     }
 
     #[test]
@@ -783,23 +1072,28 @@ mod tests {
                 &i,
             ))
             .expect("read");
-        assert_eq!(r.content, b"hello");
+        assert_eq!(r.content.to_vec(), b"hello");
         let (r, _) = rt()
             .block_on(parse(
                 b"POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6;x=y\r\n world\r\n0\r\nT: v\r\n\r\n",
                 &i,
             ))
             .expect("read");
-        assert_eq!(r.content, b"hello world");
+        assert_eq!(r.content.to_vec(), b"hello world");
     }
 
     #[test]
     fn limits_and_errors() {
         let i = info();
-        let big = format!("POST / HTTP/1.0\r\nContent-Length: {}\r\n\r\n", 10_000);
+        let big = format!("POST / HTTP/1.0\r\nContent-Length: {}\r\n\r\n", 10_240_001);
         assert!(matches!(
             rt().block_on(parse(big.as_bytes(), &i)),
             Err(ReadError::Status(413))
+        ));
+        // A spooled body cut short by the client.
+        assert!(matches!(
+            rt().block_on(parse(&post(10_000, b"abc"), &i)),
+            Err(ReadError::Eof)
         ));
         let long = format!("GET /{} HTTP/1.0\r\n\r\n", "a".repeat(5000));
         assert!(matches!(

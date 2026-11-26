@@ -14,9 +14,12 @@ wait for the next request.
 ## Decision
 
 * **Drivers are tokio tasks.**  One accept loop per driver plus one task per
-  client socket does read-ahead (request line, headers and body, within
-  `maxline`/`maxheader`/`maxinput`), keep-alive waits (`keepwait`) and
-  graceful close (`closewait`).  Idle keep-alive sockets cost a task, not a
+  client socket does read-ahead (request line and headers within
+  `maxline`/`maxheader`, then the body up to the request's `maxupload`),
+  keep-alive waits (`keepwait`) and graceful close (`closewait`).  A body
+  whose request reaches `maxinput` is written to a temp file as it
+  arrives, as AOLserver's driver thread does; the connection thread reads
+  it from there.  Idle keep-alive sockets cost a task, not a
   thread.
 * **Connection threads are plain OS threads** in `nsd::pool::Pool`, sized
   by `minthreads`/`maxthreads`, with idle timeout and `maxconns`

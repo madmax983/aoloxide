@@ -315,7 +315,7 @@ impl Cgi {
                 return conn.return_internal_error();
             }
         };
-        let body = conn.conn().content.clone();
+        let body = conn.conn().content.to_vec();
         let stdin = child.stdin.take();
         let writer = std::thread::spawn(move || {
             if let Some(mut s) = stdin {
