@@ -40,6 +40,7 @@ dependencies = [
  "nscp",
  "nsd",
  "nsdb",
+ "nsext",
  "nslog",
  "nsperm",
  "nsproxy",
@@ -463,12 +464,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsext"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "ns-core",
+ "ns-script",
+ "nsd",
+ "nsdb",
+ "nspd",
+ "tempfile",
+]
+
+[[package]]
 name = "nslog"
 version = "0.1.0"
 dependencies = [
  "ns-core",
  "ns-script",
  "nsd",
+ "tempfile",
+]
+
+[[package]]
+name = "nspd"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "nsdb",
  "tempfile",
 ]
 

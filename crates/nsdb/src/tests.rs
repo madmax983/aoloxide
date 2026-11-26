@@ -519,3 +519,136 @@ fn sql_logging_follows_ns_db_log_sql() {
     assert_eq!(all[0], "Notice: dbinit: sql(:memory:): 'select 1'");
     assert!(all[1].starts_with("Error: dbinit: error(:memory:,"));
 }
+
+#[test]
+fn connection_defaults() {
+    let mut c = SqliteDriver.open(":memory:", None, None).expect("open");
+    assert!(c.bind_row().is_none() && c.db_type().is_none() && c.as_any_mut().is_none());
+    assert!(!c.supports_sp());
+    c.exec("select 1 as a").expect("sel");
+    assert_eq!(c.next_row_n(1).expect("row"), Some(vec![Some("1".into())]));
+    assert!(c.try_flush().is_ok() && c.cancel().is_ok());
+    let no = "stored procedures are not supported";
+    assert_eq!(c.sp_start("p").expect_err("sp").message, no);
+    assert_eq!(c.sp_setparam("a").expect_err("sp").message, no);
+    assert_eq!(c.sp_exec().expect_err("sp").message, no);
+    assert_eq!(c.sp_returncode().expect_err("sp").message, no);
+    assert_eq!(c.sp_getparams().expect_err("sp").message, no);
+}
+
+/// A connection that dies after its first statement, as an external
+/// driver's does when the daemon goes away.
+struct Dying {
+    alive: bool,
+}
+
+impl DbConnection for Dying {
+    fn exec(&mut self, _: &str) -> Result<ExecResult, DbError> {
+        self.alive = false;
+        Err(DbError {
+            code: "GONE".into(),
+            message: "daemon went away".into(),
+        })
+    }
+    fn next_row(&mut self) -> Result<Option<Vec<Option<String>>>, DbError> {
+        Ok(None)
+    }
+    fn flush(&mut self) {}
+    fn connected(&self) -> bool {
+        self.alive
+    }
+    fn db_type(&self) -> Option<String> {
+        Some("Dying".into())
+    }
+}
+
+struct DyingDriver;
+
+impl DbDriver for DyingDriver {
+    fn name(&self) -> &'static str {
+        "dying"
+    }
+    fn db_type(&self) -> &'static str {
+        "Static"
+    }
+    fn open(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<Box<dyn DbConnection>, DbError> {
+        Ok(Box::new(Dying { alive: true }))
+    }
+}
+
+#[test]
+fn a_connection_the_driver_drops_disconnects_the_handle() {
+    let c = PoolConfig::new("d", Arc::new(DyingDriver), "x");
+    let p = Arc::new(Pool::new(c, Arc::new(|_, _| {})));
+    let mut h = p.get_handles(1, None).expect("get").pop().expect("handle");
+    assert!(h.connected());
+    assert_eq!(h.db_type(), "Dying");
+    assert!(h.with_connection(|c| c.connected()).expect("connected"));
+    assert!(h.exec("select 1").is_err());
+    assert_eq!(h.exception(), ("GONE", "daemon went away"));
+    assert!(!h.connected(), "the dead connection was dropped");
+    assert_eq!(h.db_type(), "");
+    assert!(h.with_connection(|_| ()).is_none());
+    assert!(!h.cancel() && !h.supports_sp());
+    drop(h);
+    // The next checkout reconnects.
+    let h = p.get_handles(1, None).expect("get").pop().expect("handle");
+    assert!(h.connected());
+}
+
+#[test]
+fn driver_modules_load_from_their_config() {
+    let made: Arc<Mutex<Vec<String>>> = Arc::default();
+    let m = Arc::clone(&made);
+    register_driver(
+        "nstestext",
+        Arc::new(move |dc: &DriverConfig<'_>| {
+            lock(&m).push(format!(
+                "{} {} {:?} {:?}",
+                dc.name,
+                dc.path,
+                dc.config.get(&dc.path, "opt"),
+                dc.home
+            ));
+            match dc.name {
+                "good" => Ok(Arc::new(DyingDriver) as Arc<dyn DbDriver>),
+                "half" => Err(Some(Arc::new(DyingDriver) as Arc<dyn DbDriver>)),
+                _ => Err(None),
+            }
+        }),
+    );
+    let mut c = Config::new();
+    for n in ["good", "half", "bad"] {
+        c.put("ns/db/drivers", n, "nstestext.so");
+        c.put("ns/db/pools", &format!("p{n}"), "");
+        c.put(&format!("ns/db/pool/p{n}"), "driver", n);
+        c.put(&format!("ns/db/pool/p{n}"), "datasource", "x");
+    }
+    c.put("ns/db/driver/good", "opt", "1");
+    let (log, logs) = capture();
+    let st = DbState::build_in(&c, &log, Some(std::path::Path::new("/home")));
+    assert!(st.get_pool("pgood").is_some() && st.get_pool("phalf").is_some());
+    assert!(st.get_pool("pbad").is_none());
+    assert_eq!(
+        lock(&made).clone(),
+        vec![
+            "good ns/db/driver/good Some(\"1\") Some(\"/home\")",
+            "half ns/db/driver/half None Some(\"/home\")",
+            "bad ns/db/driver/bad None Some(\"/home\")",
+        ]
+    );
+    let l = lock(&logs).clone();
+    for m in [
+        "Error: dbdrv: failed to load driver 'half'",
+        "Error: dbdrv: failed to load driver 'bad'",
+        "Error: dbinit: no such driver 'bad' for pool 'pbad'",
+    ] {
+        assert!(l.contains(&m.to_owned()), "{m} {l:?}");
+    }
+    assert!(driver_factory("nosuch").is_none());
+}

@@ -1,7 +1,9 @@
 //! The database driver interface (`include/nsdb.h`, `Ns_DbDriver*`) and the
 //! built-in SQLite driver.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// A database error with an optional native code (`ns_dberrorcode`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -33,23 +35,92 @@ pub enum ExecResult {
     Rows(Vec<String>),
 }
 
+/// The error of a stored-procedure call on a driver without them.
+fn no_sp() -> DbError {
+    DbError::msg("stored procedures are not supported")
+}
+
 /// An open database connection.
+///
+/// Only `exec`, `next_row` and `flush` are required; the other methods
+/// have defaults that suit drivers which buffer a query's rows when it
+/// runs (the SQLite driver).  Drivers that talk to a server on each call
+/// (`nsext`) override them.
 pub trait DbConnection: Send {
     /// Execute `sql` (`Ns_DbExec`).
     fn exec(&mut self, sql: &str) -> Result<ExecResult, DbError>;
     /// Next row of the last query (`Ns_DbGetRow`); `None` at the end.
     /// NULL columns are `None`.
     fn next_row(&mut self) -> Result<Option<Vec<Option<String>>>, DbError>;
+    /// Next row for a row set of `ncols` columns: `Ns_DbGetRow` passes
+    /// the caller's set, whose size some drivers send on.
+    fn next_row_n(&mut self, ncols: usize) -> Result<Option<Vec<Option<String>>>, DbError> {
+        let _ = ncols;
+        self.next_row()
+    }
+    /// The columns of the pending query (`Ns_DbBindRow`).  `None` means
+    /// the columns [`DbConnection::exec`] returned apply.
+    fn bind_row(&mut self) -> Option<Result<Vec<String>, DbError>> {
+        None
+    }
     /// Discard any pending rows (`Ns_DbFlush`).
     fn flush(&mut self);
+    /// Discard pending rows, reporting failure (`Ns_DbFlush`'s status);
+    /// by default [`DbConnection::flush`], which cannot fail.
+    fn try_flush(&mut self) -> Result<(), DbError> {
+        self.flush();
+        Ok(())
+    }
+    /// Cancel the pending query (`Ns_DbCancel`); by default a flush.
+    fn cancel(&mut self) -> Result<(), DbError> {
+        self.try_flush()
+    }
     /// Reset the connection after an error (`Ns_DbResetHandle`).
     fn reset(&mut self) -> Result<(), DbError> {
         self.flush();
         Ok(())
     }
-    /// Whether the connection is usable.
+    /// Whether the connection is usable.  A handle drops a connection
+    /// that reports `false` and is then disconnected.
     fn connected(&self) -> bool {
         true
+    }
+    /// This connection's database type, when it is not the driver's
+    /// [`DbDriver::db_type`] (`Ns_DbDriverDbType`).
+    fn db_type(&self) -> Option<String> {
+        None
+    }
+    /// The connection as `Any`, for driver-specific commands (`ns_ext`).
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+    /// Whether the driver implements stored procedures (`ns_db sp_*`).
+    fn supports_sp(&self) -> bool {
+        false
+    }
+    /// Begin a stored procedure (`Ns_DbSpStart`).
+    fn sp_start(&mut self, procname: &str) -> Result<(), DbError> {
+        let _ = procname;
+        Err(no_sp())
+    }
+    /// Set a parameter; `args` is `name type in|out value`
+    /// (`Ns_DbSpSetParam`).
+    fn sp_setparam(&mut self, args: &str) -> Result<(), DbError> {
+        let _ = args;
+        Err(no_sp())
+    }
+    /// Run the procedure (`Ns_DbSpExec`).  The columns of a row result
+    /// come from [`DbConnection::bind_row`].
+    fn sp_exec(&mut self) -> Result<ExecResult, DbError> {
+        Err(no_sp())
+    }
+    /// The procedure's return code (`Ns_DbSpReturnCode`).
+    fn sp_returncode(&mut self) -> Result<String, DbError> {
+        Err(no_sp())
+    }
+    /// The output parameters as `(name, value)` pairs (`Ns_DbSpGetParams`).
+    fn sp_getparams(&mut self) -> Result<Vec<(String, Option<String>)>, DbError> {
+        Err(no_sp())
     }
 }
 
@@ -66,6 +137,60 @@ pub trait DbDriver: Send + Sync {
         user: Option<&str>,
         password: Option<&str>,
     ) -> Result<Box<dyn DbConnection>, DbError>;
+    /// Per-server set-up, run for each pool of the driver a server may
+    /// use (`DbFn_ServerInit` via `NsDbDriverInit`), for example to add
+    /// driver-specific commands.
+    fn server_init(&self, server: &Arc<nsd::Server>) -> Result<(), String> {
+        let _ = server;
+        Ok(())
+    }
+}
+
+/// What a [`DriverFactory`] is given (`Ns_DbDriverInit(hDriver,
+/// configPath)`).
+pub struct DriverConfig<'a> {
+    /// The driver's name in `ns/db/drivers` (`hDriver`).
+    pub name: &'a str,
+    /// Its config section, `ns/db/driver/<name>`.
+    pub path: String,
+    /// The process config.
+    pub config: &'a ns_core::config::Config,
+    /// The server home, for relative paths (`Ns_HomePath`), when known.
+    pub home: Option<&'a Path>,
+    /// Where the driver logs.
+    pub log: &'a crate::Logger,
+}
+
+/// Creates a driver from its config (`Ns_DbDriverInit`).  `Err(Some(d))`
+/// means the driver registered itself but its init failed, which
+/// AOLserver still uses for pools; `Err(None)` means nothing registered.
+pub type DriverFactory = Arc<
+    dyn Fn(&DriverConfig<'_>) -> Result<Arc<dyn DbDriver>, Option<Arc<dyn DbDriver>>> + Send + Sync,
+>;
+
+type Factories = Mutex<BTreeMap<String, DriverFactory>>;
+
+fn factories() -> &'static Factories {
+    static F: OnceLock<Factories> = OnceLock::new();
+    F.get_or_init(Factories::default)
+}
+
+/// Make a compiled-in driver module loadable from `ns/db/drivers` under
+/// `key`, its module name (`ns_param external nsext.so` loads `nsext`).
+pub fn register_driver(key: &str, factory: DriverFactory) {
+    factories()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key.to_owned(), factory);
+}
+
+/// The factory registered under `key`.
+pub fn driver_factory(key: &str) -> Option<DriverFactory> {
+    factories()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(key)
+        .cloned()
 }
 
 /// The SQLite driver (`datasource` is a file path or `:memory:`).

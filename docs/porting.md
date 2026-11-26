@@ -49,6 +49,9 @@ intentional behavioural deviation, and tracks what is not yet ported.
 | `nscp/` | `crates/nscp` |
 | `nsdb/` | `crates/nsdb` (`driver.rs`: driver trait + SQLite) |
 | `nsproxy/nsproxylib.c`, `nsproxy.c` | `crates/nsproxy` (`src/bin/nsproxy.rs` is the worker) |
+| `nsext/nsext.c` | `crates/nsext` (`conn.rs`: the protocol client, `cmd.rs`: `ns_ext`) |
+| `nsext/msg.c`, `include/nsextmsg.h` | `crates/nspd/src/msg.rs` |
+| `nspd/main.c`, `listen.c`, `log.c`, `include/nspd.h` | `crates/nspd` (`src/bin/nssqlitepd.rs`: an SQLite daemon) |
 | `nsd/dstring.c`, `index.c`, `lisp.c`, `str.c`, `dsprintf.c`, `fd.c`, `binder.c` | replaced by the Rust standard library |
 
 ## Intentional deviations
@@ -103,8 +106,9 @@ Modules:
     `nsopenssl` module names; it accepts PEM `certfile`/`keyfile` only (no
     OpenSSL cipher strings or client-certificate options).
 17. `nsdb` ships a SQLite driver (`sqlite`) in place of AOLserver's
-    external C drivers.  Drivers buffer a query's rows when it runs;
-    `ns_db sp_*` (stored procedures) return a "not supported" error.
+    external C drivers.  The SQLite driver buffers a query's rows when it
+    runs; on drivers without stored procedures (SQLite) `ns_db sp_*`
+    return a "not supported" error.
 18. `ns_proxy active pool` lists checked-out handles that are evaluating.
     AOLserver walked the pool's *free* list, so it always returned an
     empty list.
@@ -160,6 +164,46 @@ Modules:
     private protocol descriptors are close-on-exec.  A closing worker is
     reaped by polling for its exit rather than for EOF on its result pipe;
     the `SIGTERM`/`SIGKILL` sequence and its warnings match AOLserver.
+29. **nsext:** Driver modules are compiled in and registered with
+    `nsdb::register_driver`; `ns_param external nsext.so` in
+    `ns/db/drivers` loads `nsext` from `ns/db/driver/external` as
+    `Ns_DbDriverInit` did.  A driver whose config is unusable is still
+    registered (as in AOLserver) and its handles fail to open.
+30. **nsext:** Replies are read through a buffer instead of being peeked
+    (`MSG_PEEK`) and then read, so a reply line split across packets is
+    no longer a protocol error.  Lines must still fit AOLserver's buffers
+    (4096 bytes for a status, 32768 for a response, 256 for an `exec`
+    reply, 32 for a list element's size).  An element size below `-1`
+    is a protocol error (AOLserver used it as a length).  Exception codes
+    are kept whole (AOLserver copied them into a 6-byte buffer), and an
+    `ok` status does not clear the handle's exception message (every
+    `ns_db` command clears the exception before it runs).
+31. **nsext:** `spgetparams` reads the values list even when the names
+    list is empty.  AOLserver stopped after an empty names list, leaving
+    the values unread and the next reply out of step (the reply shapes
+    are proved to agree in `verus/extproto.rs`).
+32. **nsext:** `ns_ext cpto` and `cpfrom` report a failed copy even when
+    the remote file then closes cleanly.  AOLserver returned the status
+    of the final `closefile`, so a failed write could report success.
+33. **nsext:** `ns_ext` on a handle whose daemon connection was dropped
+    after an error raises `handle "nsdbN" is not connected` (AOLserver
+    dereferenced the freed connection).
+34. **nspd:** The daemon library serves each accepted connection on a
+    thread of one process; AOLserver forked a process per connection.
+    Tracing and open remote files belong to each connection.  Requests
+    are read through a buffer (a header split across reads is not an
+    error; a negative argument length ends the session, as a too-long
+    one does).  `closefile`, `readfile` and `writefile` only accept
+    descriptors that `openfile` returned on the same connection
+    (AOLserver used any descriptor number, the daemon's own sockets
+    included), `readfile` returns at most 4096 bytes (AOLserver
+    overflowed its 4096-byte buffer), and a `writefile` with fewer data
+    bytes than its count fails.  Newlines in reply lines become spaces.
+35. **nspd:** `nssqlitepd` serves SQLite through nsdb's SQLite driver: it
+    identifies as `SQLite Proxy Daemon v4.5`, `setmaxrows` limits the
+    rows of later queries, `resultid` is empty and stored procedures
+    fail with exception `NSPD`.  The datasource is the database file; as
+    in AOLserver the daemon changes to `/`, so it should be absolute.
 
 ## Not yet supported (phase 2)
 
@@ -170,11 +214,9 @@ contentchannel|sock|interp`, `ns_sockaccept`, `ns_sockselect`,
 `ns_socketpair`, `ns_quewait`, `ns_adp_debug`, `ns_adp_ctl channel`,
 `ns_ictl cancel`.
 
-Modules still to port:
-
-| Module | Plan |
-|---|---|
-| `nsext`, `nspd` | external database proxy protocol, as an `nsdb` driver |
+All of AOLserver 4.5's modules are ported.  `nsext` does not implement
+the `gettableinfo`, `tablelist` and `bestrowid` messages (AOLserver's
+never sent them, and `nspd` never answered them).
 
 Also planned: spooling large uploads to temp files, `ns_sockcallback` on
 the tokio runtime, and channel transfer for `ns_chan`.
@@ -189,6 +231,7 @@ the tokio runtime, and channel transfer for `ns_chan`.
 | `glob.rs` | an executable `*`/`?` matcher equals the recursive spec; literal and `*` lemmas |
 | `pool.rs` | pool transitions keep `idle ≤ current ≤ max`; enqueue never strands work while there is capacity |
 | `cache.rs` | inserts keep total size ≤ max; eviction removes only LRU entries |
+| `extproto.rs` | the nsext/nspd protocol: for every message nsext sends, the daemon's reply has the number of items nsext reads (on `ok` and on error); the connection returns to `Ready` after exactly one reply, never sends while a reply is outstanding, and stays `Dead` after an I/O or framing error; unanswered messages are never sent |
 | `proxy.rs` | nsproxy handle accounting (`avail + out = max`, idle workers ≤ spare capacity under any interleaving of get, release and config, including a config between a failed `get`'s pops and its give-back; a failed `get` restores the pool) and the `Idle → Busy → Done → Idle` proxy state machine |
 
 The production implementations are additionally checked against the same
