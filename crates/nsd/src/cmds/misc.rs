@@ -1139,9 +1139,30 @@ fn ns_chan(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
                 return Err(wrong_args(argv, 1, "get name"));
             }
             let name = &argv[2];
-            let det = lock_chans()
-                .remove(name)
-                .ok_or_else(|| Exception::error(format!("no such shared channel: {name}")))?;
+            let det = {
+                let mut table = lock_chans();
+                let det = table
+                    .get(name)
+                    .ok_or_else(|| Exception::error(format!("no such shared channel: {name}")))?;
+                // Refuse, leaving the channel in the table, what the splice
+                // could not do (AOLserver hit Tcl's duplicate-name panic).
+                if det.engine() != interp.engine() {
+                    return Err(Exception::error(format!(
+                        "channel \"{}\" belongs to the {} engine",
+                        det.name(),
+                        det.engine()
+                    )));
+                }
+                if interp.channel_id(det.name()).is_ok() {
+                    return Err(Exception::error(format!(
+                        "channel \"{}\" already exists in this interp",
+                        det.name()
+                    )));
+                }
+                table
+                    .remove(name)
+                    .ok_or_else(|| Exception::error(format!("no such shared channel: {name}")))?
+            };
             let id = det.id();
             let cname = interp.channel_attach(det)?;
             st.borrow_mut().chans.insert(
@@ -1175,7 +1196,12 @@ fn ns_chan(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
             }
             let det = interp.channel_detach(&reg.name)?;
             st.borrow_mut().chans.remove(name);
-            lock_chans().insert(name.clone(), det);
+            // As in AOLserver the entry is overwritten, but the channel it
+            // displaces is closed rather than leaked.
+            let displaced = lock_chans().insert(name.clone(), det);
+            if let Some(old) = displaced {
+                interp.channel_close_detached(old);
+            }
             Ok(String::new())
         }
         _ => {

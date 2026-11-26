@@ -114,6 +114,11 @@ fn start() -> TestServer {
             )
             .unwrap();
             std::fs::write(pages.join("auto.adp"), "page").unwrap();
+            std::fs::write(
+                pages.join("dsrc.adp"),
+                r"<% ns_adp_debug %>[<% ns_adp_puts -nonewline [string match /tmp/adp1.1.?????? [info script]] %>]<% set fh [open [info script]]; set t [read $fh]; close $fh; nsv_set dbg file [info script]; ns_adp_puts -nonewline [join [lrange [split $t \n] 0 5] |] %>/<% ns_adp_puts -nonewline a; return; ns_adp_puts b %>c",
+            )
+            .unwrap();
         },
     )
 }
@@ -191,6 +196,20 @@ fn ns_chan_moves_channels_through_the_shared_table() {
     // cleanup -shared closes every shared channel.
     ok(&srv, "ns_chan cleanup -shared; ns_chan list -shared", "");
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "hello");
+    // `put` to a name taken again since `get` overwrites the entry, as in
+    // AOLserver, but closes (and so flushes) the displaced channel.
+    let (f1, f2) = (format!("{f}.a"), format!("{f}.b"));
+    ok(
+        &srv,
+        &format!(
+            "set a [open {f1} w]; puts -nonewline $a one; ns_chan create $a c; set g [ns_chan get c]; \
+             set b [open {f2} w]; puts -nonewline $b two; ns_chan create $b c; \
+             list [ns_chan put c] [ns_chan list -shared] [file size {f2}]"
+        ),
+        "{} c 3",
+    );
+    ok(&srv, "ns_chan cleanup -shared", "");
+    assert_eq!(std::fs::read_to_string(&f1).unwrap(), "one");
     // A channel closed behind ns_chan's back is a mismatch on put.
     ok(
         &srv,
@@ -302,8 +321,10 @@ fn adp_output_to_a_channel() {
     let out2 = tmp(&srv, "page.out");
     assert_eq!(srv.get(&format!("/tofile.adp?out={out2}")).body, "done");
     assert_eq!(std::fs::read_to_string(&out2).unwrap(), "to-file");
-    // A write failure is reported by the flush (and, with autoabort, the
-    // interp's ADP output stays disabled until its state is reset).
+    // A write failure is reported by the flush, and with autoabort the
+    // next flush is refused; the final flush still resets the ADP state
+    // (NsAdpFlush runs NsAdpReset when not streaming), so the next
+    // `ns_adp_ctl channel {}` is a no-op.
     let e = eval(
         &srv,
         &format!(
@@ -317,6 +338,18 @@ fn adp_output_to_a_channel() {
         "ns_adp_ctl channel {}",
         "adp flush disabled: adp aborted",
     );
+    ok(&srv, "ns_adp_ctl channel {}", "");
+    // A failing final flush also resets: the channel is forgotten.
+    let e = eval(
+        &srv,
+        &format!(
+            "set f [open {out} w]; ns_adp_ctl channel $f; close $f; ns_adp_puts x; ns_adp_ctl channel {{}}"
+        ),
+    )
+    .unwrap_err();
+    assert!(e.starts_with("can not find channel named"), "{e}");
+    ok(&srv, "ns_adp_ctl channel {}", "");
+    err(&srv, "ns_adp_flush", "no adp output context");
 }
 
 #[test]
@@ -346,6 +379,18 @@ fn adp_debug_calls_the_debuginit_proc() {
         srv.log().iter().any(|l| l.contains("no debugger at fail")),
         "error logged"
     );
+    // Once the debugger runs, each script block is sourced from a temp
+    // file with a level/chunk/file header (AdpDebug), which is removed
+    // afterwards; `return` ends only that block.
+    let page = srv.pages().join("dsrc.adp");
+    assert_eq!(
+        srv.get("/dsrc.adp").body,
+        format!(
+            "[1]#|# level: 1|# chunk: 2|# file:  {}|#|/ac",
+            page.display()
+        )
+    );
+    ok(&srv, "file exists [nsv_get dbg file]", "0");
     // Without the debuginit proc, the default is TclPro's, which is not
     // loaded.
     let plain = TestServer::start("", |_| {});
@@ -369,6 +414,11 @@ fn ictl_cancel_interrupts_a_running_script() {
         &srv,
         "ns_ictl cancel 999999",
         "no such active thread: 999999",
+    );
+    err(
+        &srv,
+        "ns_ictl threads extra",
+        "wrong # args: should be \"ns_ictl threads\"",
     );
     err(
         &srv,
@@ -420,7 +470,7 @@ fn ns_share_links_globals_across_interps() {
     err(
         &srv,
         "ns_share {a b}",
-        "error sharing ::a b can't determine existence of variable",
+        "wrong # args: should be \"info exists varName\"error sharing ::a b can't determine existence of variable",
     );
     // AOLserver called Ns_Fatal when the trace could not be set.
     let e = eval(&srv, "ns_share ::nosuch::x").unwrap_err();

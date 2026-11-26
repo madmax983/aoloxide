@@ -172,7 +172,6 @@ fn ns_adp_ctl(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
             // (NsAdpFlush with stream 0 runs NsAdpReset).
             if st.borrow().adp.chan.is_some() {
                 adp::flush_output(interp, false)?;
-                adp::reset(interp)?;
             }
         } else {
             interp.channel_check_mode(id, true)?;

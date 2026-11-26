@@ -444,6 +444,7 @@ fn ns_ictl(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
             Ok(interp.list_from(&v))
         }
         "threads" => {
+            check_args(argv, 2, 2, 2, "")?;
             let tids: Vec<String> = crate::interp::active_threads()
                 .iter()
                 .map(u64::to_string)

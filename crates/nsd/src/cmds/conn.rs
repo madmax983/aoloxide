@@ -138,29 +138,47 @@ fn conn_sock(c: &ConnRef) -> i32 {
 /// `ns_conn channel` (`MakeConnChannel` with `spliceout`): flush queued
 /// output, then hand the connection's socket to a new blocking Tcl channel
 /// registered in the interp.  The connection no longer owns the socket:
-/// later writes to the connection fail and the driver forgets it.
+/// later writes to the connection fail and the driver forgets it.  If the
+/// channel cannot be made, the connection keeps its socket.
 fn conn_channel(interp: &dyn Interp, c: &ConnRef) -> ScriptResult {
     let _ = c.send(&[]);
-    let plain = {
+    let made = {
         let cc = c.conn();
         let Some(sock) = cc.sock.as_ref() else {
             return Err(Exception::error("bad file number"));
         };
-        (*sock.stream).tcp().is_some()
+        let Some(tcp) = (*sock.stream).tcp() else {
+            return Err(Exception::error(
+                "ns_conn channel: the connection is not a plain TCP socket",
+            ));
+        };
+        channel_from_dup(tcp, |s| interp.channel_from_tcp(s))?
     };
-    if !plain {
-        return Err(Exception::error(
-            "ns_conn channel: the connection is not a plain TCP socket",
-        ));
-    }
-    let Some(crate::driver::Sock { stream, .. }) = c.conn_mut().sock.take() else {
-        return Err(Exception::error("bad file number"));
+    // The channel owns its duplicate of the socket; the connection lets
+    // go of the original.
+    drop(c.conn_mut().sock.take());
+    Ok(made)
+}
+
+/// Give `make` a duplicate of `tcp` (which it sets blocking and takes
+/// over).  When `make` fails the original is made non-blocking again, so
+/// the connection can still use it (`MakeConnChannel` restores
+/// `sockPtr->sock`).
+fn channel_from_dup(
+    tcp: &tokio::net::TcpStream,
+    make: impl FnOnce(std::net::TcpStream) -> ScriptResult,
+) -> ScriptResult {
+    use std::os::fd::AsFd;
+    let dup = |fd: std::os::fd::BorrowedFd<'_>| {
+        fd.try_clone_to_owned()
+            .map(std::net::TcpStream::from)
+            .map_err(|e| Exception::error(e.to_string()))
     };
-    let tcp = <dyn crate::driver::ConnStream>::into_tcp(stream)
-        .map_err(|_| Exception::error("bad file number"))?
-        .into_std()
-        .map_err(|e| Exception::error(e.to_string()))?;
-    interp.channel_from_tcp(tcp)
+    let chan_sock = dup(tcp.as_fd())?;
+    let restore = dup(tcp.as_fd())?;
+    make(chan_sock).inspect_err(|_| {
+        let _ = restore.set_nonblocking(true);
+    })
 }
 
 fn ns_conn(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
@@ -647,6 +665,46 @@ fn ns_atclose(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn failed_channel_leaves_the_socket_usable() {
+        use std::io::{Read, Write};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let mut peer = std::net::TcpStream::connect(addr).unwrap();
+            let (tcp, _) = l.accept().await.unwrap();
+            let e = channel_from_dup(&tcp, |s| {
+                s.set_nonblocking(false).unwrap();
+                Err(Exception::error("no channel"))
+            })
+            .unwrap_err();
+            assert_eq!(e.message, "no channel");
+            // Still non-blocking and open.
+            let mut b = [0u8; 1];
+            assert_eq!(
+                tcp.try_read(&mut b).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            tcp.try_write(b"x").unwrap();
+            peer.read_exact(&mut b).unwrap();
+            assert_eq!(&b, b"x");
+            // A successful hand-off gives `make` a working duplicate.
+            let name = channel_from_dup(&tcp, |mut s| {
+                s.write_all(b"y").unwrap();
+                Ok("sock".into())
+            })
+            .unwrap();
+            assert_eq!(name, "sock");
+            peer.read_exact(&mut b).unwrap();
+            assert_eq!(&b, b"y");
+        });
+    }
 
     #[test]
     fn connid_stripping() {

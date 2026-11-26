@@ -171,9 +171,11 @@ fn share_var(interp: &dyn Interp, srv: &Arc<Server>, var_name: &str) -> Result<(
         v
     } else {
         let v = Arc::new(ShareVar::default());
-        let exists = interp.eval(&format!("info exists {gname}")).map_err(|_| {
+        // Tcl_AppendResult: the message follows the `info exists` error.
+        let exists = interp.eval(&format!("info exists {gname}")).map_err(|e| {
             Exception::error(format!(
-                "error sharing {gname} can't determine existence of variable"
+                "{}error sharing {gname} can't determine existence of variable",
+                e.message
             ))
         })?;
         if exists == "1" {

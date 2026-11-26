@@ -178,6 +178,7 @@ pub fn exec(interp: &dyn Interp, code: &AdpCode, frame: AdpFrame) -> ScriptResul
         s.adp.frames.push(frame);
     }
     let mut result = Ok(String::new());
+    let mut nscript = 0;
     for (block, line) in &code.blocks {
         if st.borrow().adp.exception != AdpException::Ok {
             break;
@@ -187,7 +188,16 @@ pub fn exec(interp: &dyn Interp, code: &AdpCode, frame: AdpFrame) -> ScriptResul
         }
         let r = match block {
             Block::Text(t) => append(interp, t),
-            Block::Script(s) => interp.eval(s),
+            Block::Script(s) => {
+                let debug_level = st.borrow().adp.debug_level;
+                let r = if debug_level > 0 {
+                    debug_eval(interp, &st, s, debug_level, nscript)
+                } else {
+                    interp.eval(s)
+                };
+                nscript += 1;
+                r
+            }
         };
         if let Err(e) = r {
             if st.borrow().adp.exception == AdpException::Ok {
@@ -214,6 +224,56 @@ pub fn exec(interp: &dyn Interp, code: &AdpCode, frame: AdpFrame) -> ScriptResul
     }
     result
 }
+
+/// `AdpDebug`: while the debugger runs, a script block is written with a
+/// header naming its level, chunk and file to a fresh
+/// `P_tmpdir/adp<level>.<chunk>.XXXXXX` file, which is then `source`d (so
+/// TclPro instruments it) and removed.
+fn debug_eval(
+    interp: &dyn Interp,
+    st: &NsInterpRef,
+    script: &str,
+    level: i32,
+    nscript: usize,
+) -> ScriptResult {
+    let file = st
+        .borrow()
+        .adp
+        .frames
+        .last()
+        .and_then(|f| f.args.first().cloned())
+        .unwrap_or_default();
+    let text = format!("#\n# level: {level}\n# chunk: {nscript}\n# file:  {file}\n#\n\n{script}");
+    let path = debug_file_name(level, nscript);
+    let shown = path.display().to_string();
+    let mut f = std::fs::File::create(&path).map_err(|e| {
+        Exception::error(format!("could not create adp debug file \"{shown}\": {e}"))
+    })?;
+    let written = std::io::Write::write_all(&mut f, text.as_bytes());
+    drop(f);
+    let r = match written {
+        Ok(()) => interp.eval(&interp.list_join(&["source", &shown])),
+        Err(e) => Err(Exception::error(format!(
+            "write to \"{shown}\" failed: {e}"
+        ))),
+    };
+    let _ = std::fs::remove_file(&path);
+    r
+}
+
+/// A `mktemp`-style name for an `AdpDebug` file that does not exist yet.
+fn debug_file_name(level: i32, nscript: usize) -> PathBuf {
+    loop {
+        let r = format!("{:016x}", crate::cmds::misc::rand_u64());
+        let p = PathBuf::from(format!("{DEBUG_TMPDIR}/adp{level}.{nscript}.{}", &r[..6]));
+        if !p.exists() {
+            return p;
+        }
+    }
+}
+
+/// `P_tmpdir`, where `AdpDebug` writes its files.
+const DEBUG_TMPDIR: &str = "/tmp";
 
 /// Parse options for a server.
 pub fn parse_opts(server: &Server) -> ParseOpts {
@@ -412,42 +472,53 @@ pub fn flush_output(interp: &dyn Interp, stream: bool) -> ScriptResult {
     if !has_conn && chan.is_none() {
         return Err(Exception::error("no adp output context"));
     }
-    if trim && !flushed {
-        buf = buf.trim_start().to_owned();
-    }
-    if ex == AdpException::Abort {
-        return Err(Exception::error("adp flush disabled: adp aborted"));
-    }
-    if buf.is_empty() && stream {
-        return Ok(String::new());
-    }
-    let mut result: ScriptResult = Ok(String::new());
-    if let Some(ch) = chan {
-        if let Err(e) = interp.channel_write(&ch, buf.as_bytes()) {
-            result = Err(e);
+    let result = 'send: {
+        if trim && !flushed {
+            buf = buf.trim_start().to_owned();
         }
-        return finish_flush(&st, result, autoabort);
-    }
-    let conn = interp_conn(interp)?;
-    if conn.is_closed() {
-        result = Err(Exception::error("adp flush failed: connection closed"));
-    } else {
-        if gzip {
-            conn.conn_mut().flags.gzip = true;
+        if ex == AdpException::Abort {
+            break 'send Err(Exception::error("adp flush disabled: adp aborted"));
         }
-        if !flushed && expire {
-            conn.cond_set_header("Expires", "now");
+        if buf.is_empty() && stream {
+            break 'send Ok(String::new());
         }
-        if !conn.headers_sent() {
-            if let Some(m) = mimetype {
-                conn.set_type(Some(&m));
+        let mut result: ScriptResult = Ok(String::new());
+        if let Some(ch) = chan {
+            if let Err(e) = interp.channel_write(&ch, buf.as_bytes()) {
+                result = Err(e);
+            }
+            break 'send finish_flush(&st, result, autoabort);
+        }
+        let conn = match interp_conn(interp) {
+            Ok(c) => c,
+            Err(e) => break 'send finish_flush(&st, Err(e), autoabort),
+        };
+        if conn.is_closed() {
+            result = Err(Exception::error("adp flush failed: connection closed"));
+        } else {
+            if gzip {
+                conn.conn_mut().flags.gzip = true;
+            }
+            if !flushed && expire {
+                conn.cond_set_header("Expires", "now");
+            }
+            if !conn.headers_sent() {
+                if let Some(m) = mimetype {
+                    conn.set_type(Some(&m));
+                }
+            }
+            if conn.flush(buf.as_bytes(), stream).is_err() {
+                result = Err(Exception::error("adp flush failed: connection flush error"));
             }
         }
-        if conn.flush(buf.as_bytes(), stream).is_err() {
-            result = Err(Exception::error("adp flush failed: connection flush error"));
-        }
+        finish_flush(&st, result, autoabort)
+    };
+    // The final flush always resets the ADP state, even when it failed
+    // (the output context and any abort exception are cleared).
+    if !stream {
+        reset(interp)?;
     }
-    finish_flush(&st, result, autoabort)
+    result
 }
 
 /// The end of `NsAdpFlush`: mark output flushed and raise an abort if a

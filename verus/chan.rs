@@ -18,7 +18,12 @@
 //! one interp (`Tcl_IsChannelShared` is false), so a cut channel is never
 //! left reachable from another interp.  The table is keyed by name;
 //! `create` refuses a name that is taken, `get` removes the entry it
-//! splices, so a channel never has two table entries.
+//! splices, so a channel never has two table entries.  `put` does not
+//! check the name (as in AOLserver, it overwrites the entry): a channel
+//! taken again under that name since the `get` is displaced, and closed
+//! rather than leaked (`displace`).  `get` checks that the splice can
+//! succeed before it removes the entry, so a refused `get` leaves the
+//! channel in the table.
 
 use vstd::prelude::*;
 
@@ -45,12 +50,26 @@ pub open spec fn shared(c: Chan) -> bool {
     c.interps > 1
 }
 
-/// Whether `ns_chan create chan name` (or `ns_chan put name`) succeeds:
-/// refused unless the channel is registered in exactly one interp
-/// (`Tcl_IsChannelShared` is false) and the name is free.  A refused
-/// operation is an error that changes nothing.
-pub open spec fn cut_ok(c: Chan, name_taken: bool) -> bool {
-    !c.closed && !c.in_table && c.interps == 1 && !name_taken
+/// Whether `ns_chan put name` can cut the channel: refused unless it is
+/// registered in exactly one interp (`Tcl_IsChannelShared` is false).  A
+/// refused operation is an error that changes nothing.
+pub open spec fn cut_ok(c: Chan) -> bool {
+    !c.closed && !c.in_table && c.interps == 1
+}
+
+/// Whether `ns_chan create chan name` succeeds: as `cut_ok`, and the name
+/// is free.
+pub open spec fn create_ok(c: Chan, name_taken: bool) -> bool {
+    cut_ok(c) && !name_taken
+}
+
+/// The channel a `put` finds under its name in the table: closed.
+pub open spec fn displace(old: Chan) -> Chan {
+    if old.in_table {
+        Chan { interps: 0, in_table: false, closed: true }
+    } else {
+        old
+    }
 }
 
 /// `UnspliceChannel`: the channel is cut and held by the table.
@@ -58,9 +77,10 @@ pub open spec fn cut(c: Chan) -> Chan {
     Chan { interps: 0, in_table: true, closed: false }
 }
 
-/// Whether `ns_chan get name` succeeds: the name is in the table.
-pub open spec fn get_ok(c: Chan) -> bool {
-    c.in_table
+/// Whether `ns_chan get name` succeeds: the name is in the table and the
+/// channel can be spliced into this interp (same engine, name free).
+pub open spec fn get_ok(c: Chan, attachable: bool) -> bool {
+    c.in_table && attachable
 }
 
 /// `SpliceChannel`: splice the table's channel into this interp.
@@ -101,10 +121,10 @@ pub open spec fn register(c: Chan) -> Chan {
 }
 
 /// `create` and `put` move the channel from its one interp to the table.
-pub proof fn cut_preserves(c: Chan, name_taken: bool)
+pub proof fn cut_preserves(c: Chan)
     requires
         inv(c),
-        cut_ok(c, name_taken),
+        cut_ok(c),
     ensures
         inv(cut(c)),
         cut(c).in_table,
@@ -112,13 +132,37 @@ pub proof fn cut_preserves(c: Chan, name_taken: bool)
 {
 }
 
-/// A channel registered in several interps, or a taken name, is refused.
+/// A channel registered in several interps is refused by `create` and
+/// `put`; a taken name is refused by `create`.
 pub proof fn shared_is_refused(c: Chan, name_taken: bool)
     requires
         inv(c),
-        shared(c) || name_taken || c.in_table,
+        shared(c) || c.in_table,
     ensures
-        !cut_ok(c, name_taken),
+        !cut_ok(c),
+        !create_ok(c, name_taken),
+{
+}
+
+pub proof fn taken_name_is_refused(c: Chan)
+    requires
+        inv(c),
+    ensures
+        !create_ok(c, true),
+{
+}
+
+/// The channel a `put` displaces from the table is closed, not left in
+/// no place at all.
+pub proof fn displace_preserves(old: Chan)
+    requires
+        inv(old),
+        old.in_table,
+    ensures
+        inv(displace(old)),
+        displace(old).closed,
+        !displace(old).in_table,
+        displace(old).interps == 0,
 {
 }
 
@@ -126,11 +170,21 @@ pub proof fn shared_is_refused(c: Chan, name_taken: bool)
 pub proof fn splice_preserves(c: Chan)
     requires
         inv(c),
-        get_ok(c),
+        get_ok(c, true),
     ensures
         inv(splice(c)),
         !splice(c).in_table,
         splice(c).interps == 1,
+{
+}
+
+/// A `get` that cannot splice the channel is refused and leaves it in
+/// the table.
+pub proof fn unattachable_get_is_refused(c: Chan)
+    requires
+        inv(c),
+    ensures
+        !get_ok(c, false),
 {
 }
 
@@ -168,8 +222,8 @@ pub proof fn put_get_round_trip(c: Chan)
         c.interps == 1,
         !c.in_table,
     ensures
-        cut_ok(c, false),
-        get_ok(cut(c)),
+        cut_ok(c),
+        get_ok(cut(c), true),
         splice(cut(c)) == c,
 {
 }
@@ -177,14 +231,14 @@ pub proof fn put_get_round_trip(c: Chan)
 /// A channel held by the table cannot be reached by script operations:
 /// registering and unregistering leave it where it is, and it cannot be
 /// cut again.
-pub proof fn table_is_exclusive(c: Chan, name_taken: bool)
+pub proof fn table_is_exclusive(c: Chan)
     requires
         inv(c),
         c.in_table,
     ensures
         register(c) == c,
         unregister(c) == c,
-        !cut_ok(c, name_taken),
+        !cut_ok(c),
 {
 }
 

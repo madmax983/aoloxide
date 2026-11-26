@@ -167,12 +167,18 @@ Modules:
     `ns_chan put` find a channel by name and identity, so one the script
     already closed is skipped (AOLserver used the stale pointer), and
     `ns_chan get` of a channel whose name the interp already has fails
-    instead of hitting Tcl's duplicate-name panic.  `ns_chan list` returns
-    names in sorted order.
+    instead of hitting Tcl's duplicate-name panic, and leaves the channel
+    in the shared table.  `ns_chan put` to a name that was taken again
+    since the `get` overwrites the entry as AOLserver did, but closes the
+    channel it displaces (flushing its output) where AOLserver leaked it
+    (see `verus/chan.rs`).  `ns_chan list` returns names in sorted order.
 30 (channels). `ns_conn channel` needs a plain TCP connection: on a TLS
     connection it fails, and `ns_conn sock` returns -1 there (AOLserver
     handed out the raw, encrypted socket).  A second `ns_conn channel`
-    fails with "bad file number".
+    fails with "bad file number".  The channel wraps a duplicate of the
+    socket descriptor (the original is owned by the async runtime until
+    the channel exists, so a failure leaves the connection its socket),
+    so its `sockN` name need not match the earlier `ns_conn sock`.
 31 (channels). `ns_ictl threads` reports each thread that created an interp
     as the number `N` of `ns_thread id`'s `ThreadId(N)`, and `ns_ictl
     cancel` accepts either form.  When Tcl's event loop runs the cancel
