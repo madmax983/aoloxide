@@ -1066,6 +1066,17 @@ impl ConnCtx {
     /// file belongs to the connection.  Failures are logged.
     pub fn content_fd(&self) -> io::Result<std::os::unix::io::RawFd> {
         let r = self.conn_mut().content.fd();
+        self.log_content_error(r)
+    }
+
+    /// A `dup` of [`ConnRef::content_fd`]'s descriptor, sharing its offset
+    /// (for a CGI's standard input).  Failures are logged.
+    pub fn content_file(&self) -> io::Result<std::fs::File> {
+        let r = self.conn_mut().content.dup_fd();
+        self.log_content_error(r)
+    }
+
+    fn log_content_error<T>(&self, r: io::Result<T>) -> io::Result<T> {
         if let Err(e) = &r {
             self.server.global.log(
                 Severity::Error,

@@ -863,6 +863,15 @@ proc copy_proc {} {
     file delete $tmp
     ns_return 200 text/plain [list $sz $head $wsz [ns_conn contentavail]]
 }
+ns_register_proc GET /flags flags_proc
+proc flags_proc {} {
+    ns_return 200 text/plain [list [expr {[ns_conn flags] & 0x80}] [ns_conn contentlength]]
+}
+ns_register_proc POST /nul nul_proc
+proc nul_proc {} {
+    ns_return 200 text/plain [list [string length [ns_conn content]] \
+        [string length [ns_conn content 0 [ns_conn contentlength]]]]
+}
 ns_register_proc POST /upload upload_proc
 proc upload_proc {} {
     set form [ns_getform]
@@ -900,6 +909,30 @@ proc upload_proc {} {
     );
     let r = post(&srv, "/copy", form, &big);
     assert_eq!(r.body, "6004 1&b= 6006 0");
+    // Without a range, `ns_conn content` is a C string: it stops at the
+    // first NUL, in memory or spooled.
+    for n in [10, 1000] {
+        let r = post(&srv, "/nul", "text/plain", &"ab\0cd".repeat(n));
+        assert_eq!(r.body, format!("2 {}", 5 * n));
+    }
+    // The request line and headers must end within maxinput (E_RRANGE).
+    let mut many = String::from("GET /flags HTTP/1.0\r\n");
+    for n in 0..70 {
+        many.push_str(&format!("X-H{n}: {}\r\n", "v".repeat(90)));
+    }
+    many.push_str("\r\n");
+    assert_eq!(Response::parse(&srv.raw(&many)).status, 400);
+    // A bodiless request whose head reaches maxinput - 2 still spools its
+    // (empty) content, as `SockReadLine` does with len = 0.
+    let head = |total: usize| {
+        let base = "GET /flags HTTP/1.0\r\nX-Pad: \r\n\r\n".len();
+        format!(
+            "GET /flags HTTP/1.0\r\nX-Pad: {}\r\n\r\n",
+            "p".repeat(total - base)
+        )
+    };
+    assert_eq!(Response::parse(&srv.raw(&head(4094))).body, "128 0");
+    assert_eq!(Response::parse(&srv.raw(&head(4093))).body, "0 0");
     // A multipart upload whose file part makes the body spill to disk.
     let file: String = (0..8000u32)
         .map(|i| char::from(b'a' + (i % 26) as u8))

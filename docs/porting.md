@@ -64,15 +64,22 @@ HTTP handling:
 2. **Chunked request bodies** are decoded and **`Expect: 100-continue`** is
    honoured.
 3. **Malformed requests get a status line** (400, 413, 414) before the
-   socket closes; AOLserver mostly dropped them silently.
+   socket closes; AOLserver mostly dropped them silently.  This includes a
+   request line and headers that do not end within the driver's
+   `maxinput` (`E_RRANGE`, 400).  As in AOLserver, `maxheader` is read but
+   not used.
 4. **Bodies over the request's `ns_limits` `maxupload`** (default 10 MB)
    are rejected with 413 before they are read; AOLserver closed the socket
    without a reply.  As in AOLserver, a body whose request (line, headers,
    body and a trailing CRLF) reaches the driver's `maxinput` is spooled to
    an unlinked temp file (`Ns_GetTemp`) instead of memory, and the file
-   returns to the temp-file pool when the connection is done.  Chunked
-   bodies (deviation 2) start in memory and spill to a temp file when the
-   next chunk would reach `maxinput`.
+   returns to the temp-file pool when the connection is done.  A request
+   without a `Content-Length` counts as a 0-byte body there, so its empty
+   body is spooled too when the head alone reaches `maxinput`.  Temp
+   files are created in `/tmp` (`P_tmpdir`, `TMPDIR` is ignored), and
+   `nscgi` gives the CGI the temp file as its standard input.  Chunked
+   bodies (deviation 2) take the same first decision, then spill to a
+   temp file when the next chunk would reach `maxinput`.
 5. **`+` in a URL path is a literal plus.**  AOLserver decoded `+` as a
    space in paths as well as in query strings.
 6. **A request that produced no response gets a 500** (for example a
@@ -180,8 +187,9 @@ Modules:
 30. **(spooling)** A body refused for `maxupload` counts in the limits'
     `ndropped` (`ns_limits get`), which AOLserver never incremented.  A
     temp file that cannot be created or written is always logged as an
-    error (AOLserver logged it only with the driver's `debug` on); the
-    socket is closed without a reply in both.
+    error (AOLserver logged it only with the driver's `debug` on); in
+    both, the socket is closed without a reply and no driver statistic
+    changes.
 
 ## Not yet supported (phase 2)
 

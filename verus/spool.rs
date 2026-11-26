@@ -2,7 +2,8 @@
 //! (`crates/nsd/src/driver.rs`; `SockReadLine`/`SockReadContent` in
 //! `nsd/driver.c`).
 //!
-//! A request with `Content-Length: len` is admitted only when
+//! A request with `Content-Length: len` (`len = 0` when the header is
+//! absent, as in `SockReadLine`) is admitted only when
 //! `len <= maxupload` (the `ns_limits` cap).  Its body is buffered in
 //! memory when the whole request (`head` bytes of request line and
 //! headers, the body, and room for a trailing CRLF) fits under the driver's

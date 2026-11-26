@@ -149,7 +149,11 @@ fn ns_conn(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
                 let (off, len) = content_indices(&cc.content, &argv[2], &argv[3])?;
                 cc.content.read_at(off, len).map_err(content_error)?
             } else {
-                cc.content.to_vec()
+                // `Tcl_SetResult(interp, Ns_ConnContent(conn), TCL_STATIC)`:
+                // a C string, so the body ends at its first NUL.
+                let all = cc.content.bytes().unwrap_or_default();
+                let end = all.iter().position(|&b| b == 0).unwrap_or(all.len());
+                all[..end].to_vec()
             };
             match cc.query_encoding {
                 Some(e) => e.decode_without_bom_handling(&slice).0.into_owned(),

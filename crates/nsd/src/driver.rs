@@ -2,7 +2,7 @@
 //!
 //! Each driver listens on one address.  For every accepted socket an async
 //! task reads the request ahead (request line and headers within the
-//! `maxline`/`maxheader` limits, then the body), then hands it to the
+//! `maxline` and `maxinput` limits, then the body), then hands it to the
 //! virtual server's connection queue and waits for the connection thread to give
 //! the socket back.  If the response allowed keep-alive, the task waits up
 //! to `keepwait` for the next request; otherwise it closes gracefully,
@@ -10,10 +10,13 @@
 //! `docs/adr/0003-threading-model.md`.
 //!
 //! As in `SockReadLine`, a body longer than the request's `ns_limits`
-//! `maxupload` is refused (413) before it is read.  A body whose request
+//! `maxupload` is refused (413) before it is read, and a request line and
+//! headers that do not end within `maxinput` are refused (400, AOLserver's
+//! `E_RRANGE`).  A body (empty without a `Content-Length`) whose request
 //! (line, headers, body and a trailing CRLF) reaches `maxinput` is spooled
 //! to a temp file ([`crate::content::get_temp`]) as it arrives instead of
-//! being buffered; the accounting is modelled in `verus/spool.rs`.
+//! being buffered, with the file I/O on tokio's blocking pool; the
+//! accounting is modelled in `verus/spool.rs`.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -105,10 +108,13 @@ pub struct DriverInfo {
     pub closewait: Duration,
     /// Max request/header line length.
     pub maxline: usize,
-    /// Max total header bytes.
+    /// The `maxheader` setting.  AOLserver 4.5 reads it but never uses it,
+    /// and neither does aoloxide: [`DriverInfo::maxinput`] bounds the head.
     pub maxheader: usize,
-    /// Max bytes of a request (line, headers and body) held in memory;
-    /// larger bodies are spooled to a temp file.
+    /// Max bytes of a request held in memory (`drvPtr->maxinput`): the
+    /// request line and headers must end within it (else 400), and a body
+    /// whose request (line, headers, body and a trailing CRLF) would reach
+    /// it is spooled to a temp file instead.
     pub maxinput: usize,
     /// Max open sockets.
     pub maxsock: usize,
@@ -287,13 +293,36 @@ impl From<io::Error> for ReadError {
     }
 }
 
+/// Run temp-file I/O on tokio's blocking pool, so a slow disk does not
+/// stall the other driver tasks on this worker thread.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(io::Error::other)?
+}
+
 /// A request body as it is read ahead: buffered in memory or spooled to a
 /// temp file (`connPtr->content` / `connPtr->tfd`).  `mem.len() + disk`
 /// is the bytes read so far (`connPtr->avail`); see `verus/spool.rs`.
+/// File I/O runs on the blocking pool ([`blocking`]).
 struct Body {
     mem: Vec<u8>,
     file: Option<TempFile>,
     disk: usize,
+}
+
+impl Drop for Body {
+    /// An abandoned spool file is released (rewound and truncated) on the
+    /// blocking pool too.
+    fn drop(&mut self) {
+        if let Some(f) = self.file.take() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                drop(rt.spawn_blocking(move || drop(f)));
+            }
+        }
+    }
 }
 
 impl Body {
@@ -307,10 +336,10 @@ impl Body {
     }
 
     /// A body spooled to a new temp file.
-    fn spooled() -> io::Result<Self> {
+    async fn spooled() -> io::Result<Self> {
         Ok(Self {
             mem: Vec::new(),
-            file: Some(get_temp()?),
+            file: Some(blocking(get_temp).await?),
             disk: 0,
         })
     }
@@ -324,14 +353,21 @@ impl Body {
         self.file.is_some()
     }
 
-    /// Store body bytes in the chosen sink.  Writes to the temp file are
-    /// short, buffered-cache writes of at most one read buffer, done in
-    /// place as `SockReadContent` does in the driver thread.
-    fn push(&mut self, data: &[u8]) -> io::Result<()> {
-        match &mut self.file {
-            Some(f) => {
-                std::io::Write::write_all(f.file_mut(), data)?;
-                self.disk += data.len();
+    /// Store body bytes in the chosen sink, as `SockReadContent` writes
+    /// each read to the temp file.
+    async fn push(&mut self, data: &[u8]) -> io::Result<()> {
+        match self.file.take() {
+            Some(mut f) => {
+                let data = data.to_vec();
+                let n = data.len();
+                self.file = Some(
+                    blocking(move || {
+                        std::io::Write::write_all(f.file_mut(), &data)?;
+                        Ok(f)
+                    })
+                    .await?,
+                );
+                self.disk += n;
             }
             None => self.mem.extend_from_slice(data),
         }
@@ -339,34 +375,45 @@ impl Body {
     }
 
     /// Move a growing in-memory body to a temp file (chunked bodies).
-    fn spill(&mut self) -> io::Result<()> {
-        let mut t = get_temp()?;
-        std::io::Write::write_all(t.file_mut(), &self.mem)?;
-        self.disk = self.mem.len();
-        self.mem = Vec::new();
+    async fn spill(&mut self) -> io::Result<()> {
+        let mem = std::mem::take(&mut self.mem);
+        let n = mem.len();
+        let t = blocking(move || {
+            let mut t = get_temp()?;
+            std::io::Write::write_all(t.file_mut(), &mem)?;
+            Ok(t)
+        })
+        .await?;
+        self.disk = n;
         self.file = Some(t);
         Ok(())
     }
 
-    /// The finished body, a spooled one rewound for reading.
-    fn finish(self) -> io::Result<Content> {
-        match self.file {
+    /// The finished body, a spooled one truncated and rewound for reading.
+    async fn finish(mut self) -> io::Result<Content> {
+        match self.file.take() {
             Some(mut f) => {
-                f.file_mut().set_len(self.disk as u64)?;
-                std::io::Seek::seek(f.file_mut(), std::io::SeekFrom::Start(0))?;
-                Ok(Content::spooled(f, self.disk))
+                let len = self.disk;
+                blocking(move || {
+                    f.file_mut().set_len(len as u64)?;
+                    std::io::Seek::seek(f.file_mut(), std::io::SeekFrom::Start(0))?;
+                    Ok(Content::spooled(f, len))
+                })
+                .await
             }
-            None => Ok(Content::memory(self.mem)),
+            None => Ok(Content::memory(std::mem::take(&mut self.mem))),
         }
     }
 }
 
 /// Move up to `need` bytes from the front of `buf` into `body`.  Returns
 /// the bytes taken (`take` in `verus/spool.rs`).
-fn take_body(buf: &mut Vec<u8>, body: &mut Body, need: usize) -> io::Result<usize> {
+async fn take_body(buf: &mut Vec<u8>, body: &mut Body, need: usize) -> io::Result<usize> {
     let n = need.min(buf.len());
-    body.push(&buf[..n])?;
-    buf.drain(..n);
+    if n > 0 {
+        body.push(&buf[..n]).await?;
+        buf.drain(..n);
+    }
     Ok(n)
 }
 
@@ -446,7 +493,10 @@ async fn read_request(
         } else if buf.len() > info.maxline {
             return Err(ReadError::Status(414));
         }
-        if buf.len() > info.maxheader {
+        // `E_RRANGE`: the request line and headers must end within the
+        // first `maxinput` bytes (`maxheader` is read but unused, as in
+        // AOLserver).
+        if buf.len() >= info.maxinput {
             return Err(ReadError::Status(400));
         }
         read_more(stream, buf, wait, info.bufsize).await?;
@@ -472,6 +522,11 @@ async fn read_request(
                 .map_err(|_| ReadError::Status(400))?;
         }
     }
+    // A head that ends past `maxinput` was read in one large read here;
+    // `SockReadLine` never reads past `maxinput`.
+    if body_start > info.maxinput {
+        return Err(ReadError::Status(400));
+    }
     buf.drain(..body_start);
     let chunked = headers
         .iget("transfer-encoding")
@@ -493,28 +548,18 @@ async fn read_request(
         limits.drop_upload();
         ReadError::Status(413)
     };
-    let mut body = Body::memory(0);
-    if let Some(len) = length.filter(|_| !chunked) {
-        if len > maxupload {
-            return Err(too_large());
-        }
-        if expects_continue && buf.len() < len {
-            let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
-        }
-        body = if spools(body_start, len, info.maxinput) {
-            Body::spooled()?
-        } else {
-            Body::memory(len)
-        };
-        loop {
-            let owed = len - body.read();
-            take_body(buf, &mut body, owed)?;
-            if body.read() == len {
-                break;
-            }
-            read_more(stream, buf, info.recvwait, info.bufsize).await?;
-        }
-    } else if chunked {
+    // As `SockReadLine`, a request without a `Content-Length` has an empty
+    // body that still spools when its head alone reaches `maxinput`.
+    let len = length.filter(|_| !chunked).unwrap_or(0);
+    if len > maxupload {
+        return Err(too_large());
+    }
+    let mut body = if spools(body_start, len, info.maxinput) {
+        Body::spooled().await?
+    } else {
+        Body::memory(len)
+    };
+    if chunked {
         if expects_continue {
             let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
         }
@@ -548,11 +593,11 @@ async fn read_request(
                 return Err(too_large());
             }
             if !body.spooling() && spools(body_start, body.read() + size, info.maxinput) {
-                body.spill()?;
+                body.spill().await?;
             }
             let mut need = size;
             loop {
-                need -= take_body(buf, &mut body, need)?;
+                need -= take_body(buf, &mut body, need).await?;
                 if need == 0 {
                     break;
                 }
@@ -563,11 +608,23 @@ async fn read_request(
             }
             buf.drain(..2);
         }
+    } else {
+        if expects_continue && buf.len() < len {
+            let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+        }
+        loop {
+            let owed = len - body.read();
+            take_body(buf, &mut body, owed).await?;
+            if body.read() == len {
+                break;
+            }
+            read_more(stream, buf, info.recvwait, info.bufsize).await?;
+        }
     }
     Ok(ReadRequest {
         request,
         headers,
-        content: body.finish()?,
+        content: body.finish().await?,
     })
 }
 
@@ -758,7 +815,6 @@ impl Driver {
                         Severity::Error,
                         &format!("{}: could not spool request content: {e}", self.info.module),
                     );
-                    self.info.stats.dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 Err(ReadError::Eof | ReadError::Io) => return,
@@ -996,6 +1052,93 @@ mod tests {
             Err(ReadError::Status(413))
         ));
         assert_eq!(l.counters().ndropped, 1);
+    }
+
+    /// A GET whose request line and headers are exactly `total` bytes.
+    fn get_head(total: usize) -> Vec<u8> {
+        let pad = "p".repeat(total - b"GET / HTTP/1.0\r\nX-Pad: \r\n\r\n".len());
+        format!("GET / HTTP/1.0\r\nX-Pad: {pad}\r\n\r\n").into_bytes()
+    }
+
+    #[test]
+    fn head_is_bounded_by_maxinput() {
+        let i = info();
+        for piece in [1, 1000, 100_000] {
+            // A head ending at maxinput is read; one byte more is E_RRANGE.
+            let (r, _) = rt()
+                .block_on(parse_with(
+                    &get_head(i.maxinput),
+                    &i,
+                    &limits(1 << 20),
+                    piece,
+                ))
+                .expect("read");
+            assert_eq!(r.request.url, "/");
+            assert!(
+                matches!(
+                    rt().block_on(parse_with(
+                        &get_head(i.maxinput + 1),
+                        &i,
+                        &limits(1 << 20),
+                        piece
+                    )),
+                    Err(ReadError::Status(400))
+                ),
+                "{piece}"
+            );
+            // Many short headers past maxinput.
+            let mut many = b"GET / HTTP/1.0\r\n".to_vec();
+            for n in 0..70 {
+                many.extend_from_slice(format!("X-H{n}: {}\r\n", "v".repeat(90)).as_bytes());
+            }
+            many.extend_from_slice(b"\r\n");
+            assert!(many.len() > i.maxinput);
+            assert!(matches!(
+                rt().block_on(parse_with(&many, &i, &limits(1 << 20), piece)),
+                Err(ReadError::Status(400))
+            ));
+        }
+        // maxheader is read but unused, as in AOLserver.
+        let mut c = Config::new();
+        c.put("ns/module/nssock", "maxheader", "1024");
+        let i =
+            DriverInfo::from_config(&c, "ns/module/nssock", "nssock", "nssock", None, false, "h");
+        assert_eq!(i.maxheader, 1024);
+        let mut big = b"GET / HTTP/1.0\r\n".to_vec();
+        for n in 0..10 {
+            big.extend_from_slice(format!("X-H{n}: {}\r\n", "v".repeat(4000)).as_bytes());
+        }
+        big.extend_from_slice(b"\r\n");
+        assert!(big.len() > 32 * 1024);
+        let (r, _) = rt().block_on(parse(&big, &i)).expect("read");
+        assert_eq!(r.headers.len(), 10);
+    }
+
+    #[test]
+    fn bodiless_request_spools_when_its_head_reaches_maxinput() {
+        let i = info();
+        // roff + 0 + 2 >= maxinput: an empty spooled body (NS_CONN_FILECONTENT).
+        let (r, _) = rt()
+            .block_on(parse(&get_head(i.maxinput - 2), &i))
+            .expect("read");
+        assert!(r.content.file_content());
+        assert_eq!(r.content.len(), 0);
+        let (r, _) = rt()
+            .block_on(parse(&get_head(i.maxinput - 3), &i))
+            .expect("read");
+        assert!(!r.content.on_disk());
+        // Chunked bodies start from the same decision.
+        let mut input = get_head(i.maxinput - 2);
+        input.truncate(input.len() - 2);
+        input.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+        let i2 = DriverInfo {
+            maxinput: input.len() + 1,
+            ..info()
+        };
+        input.extend_from_slice(b"3\r\nabc\r\n0\r\n\r\n");
+        let (r, _) = rt().block_on(parse(&input, &i2)).expect("read");
+        assert!(r.content.file_content());
+        assert_eq!(r.content.to_vec(), b"abc");
     }
 
     #[test]

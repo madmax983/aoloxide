@@ -170,8 +170,20 @@ fn nscgi_runs_scripts() {
     )
     .unwrap();
     std::fs::set_permissions(&redirect, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // What the CGI's standard input is, and how much it holds.
+    let stdin = cgi_dir.path().join("stdin.sh");
+    std::fs::write(
+        &stdin,
+        "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n'\n\
+         if [ -p /dev/stdin ]; then t=pipe; elif [ -f /dev/stdin ]; then t=file; \
+         elif [ -c /dev/stdin ]; then t=char; else t=other; fi\n\
+         echo \"$t $(wc -c | tr -d ' ')\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&stdin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let extra = format!(
-        "ns_section ns/server/s1/module/nscgi\nns_param map \"GET /cgi-bin {d}\"\nns_param map \"POST /cgi-bin {d}\"",
+        "ns_section ns/server/s1/module/nscgi\nns_param map \"GET /cgi-bin {d}\"\nns_param map \"POST /cgi-bin {d}\"\n\
+         ns_section ns/server/s1/module/nssock\nns_param maxinput 4096",
         d = cgi_dir.path().display()
     );
     let srv = boot("ns_param nscgi nscgi.so", &extra, |_| {});
@@ -185,6 +197,20 @@ fn nscgi_runs_scripts() {
     );
     assert!(r.contains("method=POST"));
     assert!(r.trim_end().ends_with("hello"), "{r}");
+    // As `Ns_ConnContentFd`: the body is the temp file (spooled or copied
+    // there), never a pipe; no body is /dev/null.
+    for n in [5, 100_000] {
+        let r = request(
+            srv.port,
+            &format!(
+                "POST /cgi-bin/stdin.sh HTTP/1.0\r\nContent-Length: {n}\r\n\r\n{}",
+                "z".repeat(n)
+            ),
+        );
+        assert!(r.trim_end().ends_with(&format!("file {n}")), "{r}");
+    }
+    let r = request(srv.port, "GET /cgi-bin/stdin.sh HTTP/1.0\r\n\r\n");
+    assert!(r.trim_end().ends_with("char 0"), "{r}");
     let r = request(srv.port, "GET /cgi-bin/redir.sh HTTP/1.0\r\n\r\n");
     assert_eq!(status(&r), 302);
     assert!(r.contains("/elsewhere"));

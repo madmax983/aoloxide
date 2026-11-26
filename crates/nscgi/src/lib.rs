@@ -15,7 +15,7 @@
 //!
 //! Scripts named `nph-*` write the full HTTP response themselves.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -287,25 +287,35 @@ impl Cgi {
                 cmd.arg(ns_core::urlencode::decode_url(a, None));
             }
         }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd
     }
 
     /// Run a CGI for `conn` (`CgiRequest`).
     pub fn run(&self, conn: &ConnRef, t: &Target) -> std::io::Result<()> {
+        // The CGI reads the body from the connection's temp file
+        // (`Ns_ConnContentFd`), or from /dev/null when there is none.
+        let stdin = if conn.conn().content.is_empty() {
+            Stdio::null()
+        } else {
+            match conn.content_file() {
+                Ok(f) => Stdio::from(f),
+                Err(_) => return conn.return_internal_error(),
+            }
+        };
         if !self.acquire() {
             self.global.log(Severity::Error, "nscgi: wait timeout");
             return conn.return_unavailable();
         }
-        let r = self.exec(conn, t);
+        let r = self.exec(conn, t, stdin);
         self.release();
         r
     }
 
-    fn exec(&self, conn: &ConnRef, t: &Target) -> std::io::Result<()> {
-        let mut child = match self.command(conn, t).spawn() {
+    fn exec(&self, conn: &ConnRef, t: &Target, stdin: Stdio) -> std::io::Result<()> {
+        let mut cmd = self.command(conn, t);
+        cmd.stdin(stdin);
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 self.global.log(
@@ -315,13 +325,6 @@ impl Cgi {
                 return conn.return_internal_error();
             }
         };
-        let body = conn.conn().content.to_vec();
-        let stdin = child.stdin.take();
-        let writer = std::thread::spawn(move || {
-            if let Some(mut s) = stdin {
-                let _ = s.write_all(&body);
-            }
-        });
         let stderr = child.stderr.take();
         let g = Arc::clone(&self.global);
         let errlog = std::thread::spawn(move || {
@@ -340,7 +343,6 @@ impl Cgi {
         } else {
             Self::copy_parsed(conn, &mut out)
         };
-        let _ = writer.join();
         let _ = errlog.join();
         let _ = child.wait();
         result

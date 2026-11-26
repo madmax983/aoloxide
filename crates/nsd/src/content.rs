@@ -13,11 +13,27 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::{Mutex, PoisonError};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Free temp files (`firstTmpPtr`).
 static TEMPS: Mutex<Vec<File>> = Mutex::new(Vec::new());
+
+/// Where new temp files are created: `P_tmpdir`, a compile-time constant
+/// in AOLserver (`TMPDIR` is not consulted).
+pub const P_TMPDIR: &str = "/tmp";
+
+/// A test override of [`P_TMPDIR`].
+static TEMP_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Create new temp files in `dir` instead of [`P_TMPDIR`] (`None` restores
+/// it).  A test hook with no AOLserver counterpart: it lets tests make
+/// [`get_temp`] fail.
+#[doc(hidden)]
+pub fn set_temp_dir(dir: Option<&Path>) {
+    *TEMP_DIR.write().unwrap_or_else(PoisonError::into_inner) = dir.map(Path::to_path_buf);
+}
 
 /// An open, unlinked temp file from the pool.  Dropping it returns the file
 /// to the pool ([`release_temp`]).
@@ -58,16 +74,25 @@ impl Drop for TempFile {
     }
 }
 
+/// The directory new temp files are created in.
+fn temp_dir() -> PathBuf {
+    TEMP_DIR
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(P_TMPDIR))
+}
+
 /// Pop or create a temp file (`Ns_GetTemp`).  New files are created as
-/// `nstmp.<sec>.<usec>` (mode 0600, exclusive) in the system temp
-/// directory and unlinked at once, so their content cannot be snooped and
+/// `nstmp.<sec>.<usec>` (mode 0600, exclusive) in [`P_TMPDIR`] and
+/// unlinked at once, so their content cannot be snooped and
 /// disappears with the last descriptor.
 pub fn get_temp() -> io::Result<TempFile> {
     let pooled = TEMPS.lock().unwrap_or_else(PoisonError::into_inner).pop();
     if let Some(file) = pooled {
         return Ok(TempFile { file: Some(file) });
     }
-    let dir = std::env::temp_dir();
+    let dir = temp_dir();
     let mut trys = 0;
     loop {
         let now = SystemTime::now()
@@ -241,6 +266,17 @@ impl Content {
         self.file = Some(t);
         Ok(fd)
     }
+
+    /// A duplicate of [`Content::fd`]'s descriptor (`dup`), sharing its file
+    /// offset, for handing the body to a child process as `nscgi` does.
+    pub fn dup_fd(&mut self) -> io::Result<File> {
+        self.fd()?;
+        self.file
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no content file"))?
+            .file()
+            .try_clone()
+    }
 }
 
 #[cfg(test)]
@@ -312,6 +348,22 @@ mod tests {
             map: OnceCell::new(),
         };
         assert!(empty.bytes().is_err());
+    }
+
+    #[test]
+    fn dup_shares_the_body() {
+        let mut c = Content::memory(b"shared".to_vec());
+        let mut f = c.dup_fd().expect("dup");
+        let mut s = String::new();
+        f.read_to_string(&mut s).expect("read");
+        assert_eq!(s, "shared");
+        assert!(c.on_disk());
+    }
+
+    #[test]
+    fn temp_files_go_in_p_tmpdir() {
+        // As `Ns_GetTemp`: P_tmpdir, whatever TMPDIR says.
+        assert_eq!(temp_dir(), Path::new("/tmp"));
     }
 
     #[test]

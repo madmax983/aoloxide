@@ -15,11 +15,15 @@ wait for the next request.
 
 * **Drivers are tokio tasks.**  One accept loop per driver plus one task per
   client socket does read-ahead (request line and headers within
-  `maxline`/`maxheader`, then the body up to the request's `maxupload`),
-  keep-alive waits (`keepwait`) and graceful close (`closewait`).  A body
-  whose request reaches `maxinput` is written to a temp file as it
-  arrives, as AOLserver's driver thread does; the connection thread reads
-  it from there.  Idle keep-alive sockets cost a task, not a
+  `maxline` and `maxinput`, then the body up to the request's
+  `maxupload`), keep-alive waits (`keepwait`) and graceful close
+  (`closewait`).  A body whose request reaches `maxinput` is written to a
+  temp file as it arrives, as AOLserver's driver thread does; the
+  connection thread reads it from there.  The temp-file calls (open,
+  write, truncate, seek, release) block, so the driver task hands each
+  one to tokio's blocking pool (`spawn_blocking`) rather than make them
+  on the runtime's worker threads, where a slow disk would stall every
+  socket on that worker.  Idle keep-alive sockets cost a task, not a
   thread.
 * **Connection threads are plain OS threads** in `nsd::pool::Pool`, sized
   by `minthreads`/`maxthreads`, with idle timeout and `maxconns`
