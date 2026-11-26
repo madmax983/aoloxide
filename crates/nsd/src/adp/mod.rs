@@ -86,6 +86,16 @@ pub struct AdpState {
     pub display: bool,
     /// Last `ns_adp_eval` result captured into a variable.
     pub depth: usize,
+    /// Channel that receives the output instead of the connection
+    /// (`ns_adp_ctl channel`).
+    pub chan: Option<String>,
+    /// TclPro debugger nesting level (`debugLevel`).
+    pub debug_level: i32,
+    /// The debugger has been initialised (`debugInit`).
+    pub debug_init: bool,
+    /// Pattern of files to debug, from the `debug` query field
+    /// (`debugFile`).
+    pub debug_file: Option<String>,
 }
 
 const MAX_DEPTH: usize = 256;
@@ -107,7 +117,7 @@ pub fn append(interp: &dyn Interp, text: &str) -> ScriptResult {
         let top = a.outputs.len() - 1;
         a.outputs[top].push_str(text);
         a.outputs.len() == 1
-            && a.has_conn
+            && (a.has_conn || a.chan.is_some())
             && (a.stream || (a.bufsize > 0 && a.outputs[0].len() > a.bufsize))
     };
     if flush {
@@ -272,8 +282,56 @@ pub fn resolve(interp: &dyn Interp, file: &str) -> Result<PathBuf, Exception> {
 /// Include a file into the current output (`NsAdpInclude`).
 pub fn include(interp: &dyn Interp, file: &str, args: &[String]) -> ScriptResult {
     let path = resolve(interp, file)?;
-    let server = Arc::clone(&state(interp)?.borrow().server);
+    let st = state(interp)?;
+    let server = Arc::clone(&st.borrow().server);
     let code = load_page(&server, &path)?;
+    // TclPro debugging (AdpSource): count nested files once the debugger
+    // runs, or start it for a file matching the page's debug pattern.
+    let debug_file = {
+        let mut s = st.borrow_mut();
+        if s.adp.debug_level > 0 {
+            s.adp.debug_level += 1;
+            None
+        } else if server.adp.debug {
+            s.adp.debug_file.clone()
+        } else {
+            None
+        }
+    };
+    if let Some(pat) = debug_file {
+        let tail = path
+            .file_name()
+            .map(|t| t.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if ns_core::glob::string_match(&tail, &pat) {
+            if let Some(conn) = crate::interp::try_conn(interp) {
+                let q = conn.form().fields;
+                let get = |k: &str| q.iget(k).map(str::to_owned);
+                let (host, port, procs) = (get("dhost"), get("dport"), get("dprocs"));
+                if let Err(e) =
+                    debug_init(interp, host.as_deref(), port.as_deref(), procs.as_deref())
+                {
+                    let _ = conn.return_notice(200, "Debug Init Failed", &e.message);
+                    st.borrow_mut().adp.exception = AdpException::Abort;
+                    return Ok(String::new());
+                }
+            }
+        }
+    }
+    let r = include_code(interp, &code, path, args);
+    let mut s = st.borrow_mut();
+    if s.adp.debug_level > 0 {
+        s.adp.debug_level -= 1;
+    }
+    r
+}
+
+fn include_code(
+    interp: &dyn Interp,
+    code: &AdpCode,
+    path: PathBuf,
+    args: &[String],
+) -> ScriptResult {
     let mut argv = vec![path.to_string_lossy().into_owned()];
     argv.extend_from_slice(args);
     let frame = AdpFrame {
@@ -283,7 +341,7 @@ pub fn include(interp: &dyn Interp, file: &str, args: &[String]) -> ScriptResult
         line: 0,
         ident: String::new(),
     };
-    exec(interp, &code, frame)
+    exec(interp, code, frame)
 }
 
 /// Evaluate ADP text or a file, capturing and returning its output
@@ -332,7 +390,7 @@ pub fn eval_capture(
 /// Send buffered output to the connection (`NsAdpFlush`).
 pub fn flush_output(interp: &dyn Interp, stream: bool) -> ScriptResult {
     let st = state(interp)?;
-    let (mut buf, ex, trim, flushed, gzip, expire, autoabort, has_conn, mimetype) = {
+    let (mut buf, ex, trim, flushed, gzip, expire, autoabort, has_conn, mimetype, chan) = {
         let mut s = st.borrow_mut();
         let a = &mut s.adp;
         if a.outputs.is_empty() {
@@ -348,9 +406,10 @@ pub fn flush_output(interp: &dyn Interp, stream: bool) -> ScriptResult {
             a.autoabort,
             a.has_conn,
             a.mimetype.clone(),
+            a.chan.clone(),
         )
     };
-    if !has_conn {
+    if !has_conn && chan.is_none() {
         return Err(Exception::error("no adp output context"));
     }
     if trim && !flushed {
@@ -362,8 +421,14 @@ pub fn flush_output(interp: &dyn Interp, stream: bool) -> ScriptResult {
     if buf.is_empty() && stream {
         return Ok(String::new());
     }
-    let conn = interp_conn(interp)?;
     let mut result: ScriptResult = Ok(String::new());
+    if let Some(ch) = chan {
+        if let Err(e) = interp.channel_write(&ch, buf.as_bytes()) {
+            result = Err(e);
+        }
+        return finish_flush(&st, result, autoabort);
+    }
+    let conn = interp_conn(interp)?;
     if conn.is_closed() {
         result = Err(Exception::error("adp flush failed: connection closed"));
     } else {
@@ -382,12 +447,114 @@ pub fn flush_output(interp: &dyn Interp, stream: bool) -> ScriptResult {
             result = Err(Exception::error("adp flush failed: connection flush error"));
         }
     }
+    finish_flush(&st, result, autoabort)
+}
+
+/// The end of `NsAdpFlush`: mark output flushed and raise an abort if a
+/// failed flush should stop the page.
+fn finish_flush(st: &NsInterpRef, result: ScriptResult, autoabort: bool) -> ScriptResult {
     st.borrow_mut().adp.flushed = true;
     if result.is_err() && autoabort {
         st.borrow_mut().adp.exception = AdpException::Abort;
     }
     result
 }
+
+/// `NsAdpReset` after a final flush with no connection: the state the
+/// next execution starts from (output context and options from the
+/// server).
+pub fn reset(interp: &dyn Interp) -> Result<(), Exception> {
+    let st = state(interp)?;
+    let mut s = st.borrow_mut();
+    let server = Arc::clone(&s.server);
+    let cfg = &server.adp;
+    let mut outputs = std::mem::take(&mut s.adp.outputs);
+    match outputs.first_mut() {
+        Some(base) => base.clear(),
+        None => outputs.push(String::new()),
+    }
+    let fresh = AdpState {
+        outputs,
+        frames: std::mem::take(&mut s.adp.frames),
+        depth: s.adp.depth,
+        bufsize: cfg.bufsize,
+        trim: cfg.trim,
+        gzip: cfg.gzip,
+        expire: cfg.expire,
+        strict: cfg.strict,
+        autoabort: cfg.autoabort,
+        display: cfg.display,
+        ..AdpState::default()
+    };
+    s.adp = fresh;
+    Ok(())
+}
+
+/// `NsAdpDebug`: initialise the TclPro debugger once per interp by
+/// calling the server's `debuginit` proc with the procs to instrument
+/// and the debugger's host and port.  The interp is marked for deletion.
+pub fn debug_init(
+    interp: &dyn Interp,
+    host: Option<&str>,
+    port: Option<&str>,
+    procs: Option<&str>,
+) -> Result<(), Exception> {
+    let st = state(interp)?;
+    if st.borrow().adp.debug_init {
+        return Ok(());
+    }
+    interp.mark_for_delete();
+    let proc_ = st.borrow().server.adp.debuginit.clone();
+    let script = interp.list_join(&[
+        &proc_,
+        procs.unwrap_or_default(),
+        host.unwrap_or_default(),
+        port.unwrap_or_default(),
+    ]);
+    if let Err(e) = interp.eval(&script) {
+        log_error(interp, &e);
+        return Err(e);
+    }
+    link_output(interp, &st);
+    let mut s = st.borrow_mut();
+    s.adp.debug_init = true;
+    s.adp.debug_level = 1;
+    Ok(())
+}
+
+/// Make `ns_adp_output` show the ADP output buffer (`Tcl_LinkVar`
+/// read-only): every read refreshes it.
+fn link_output(interp: &dyn Interp, st: &NsInterpRef) {
+    let weak = std::rc::Rc::downgrade(st);
+    let current = move || {
+        weak.upgrade()
+            .and_then(|s| s.borrow().adp.outputs.first().cloned())
+            .unwrap_or_default()
+    };
+    let _ = interp.set_global("ns_adp_output", &current());
+    let r = interp.trace_var(
+        "::ns_adp_output",
+        ns_script::TraceOps {
+            reads: true,
+            writes: true,
+            ..ns_script::TraceOps::default()
+        },
+        LINK_KEY,
+        std::rc::Rc::new(move |i, _, _, ops| {
+            if let Some(i) = i {
+                if ops.reads || ops.writes {
+                    let _ = i.set_global("ns_adp_output", &current());
+                }
+            }
+        }),
+    );
+    if let Err(e) = r {
+        log_error(interp, &e);
+    }
+}
+
+/// Trace key of the `ns_adp_output` link.
+const LINK_KEY: usize = 0x6164_7000;
 
 /// Serve an ADP file for a connection (`Ns_AdpRequest`).
 pub fn adp_request(conn: &ConnRef, file: &str) -> Status {
@@ -441,6 +608,9 @@ pub fn adp_request(conn: &ConnRef, file: &str) -> Status {
             strict: cfg.strict,
             autoabort: cfg.autoabort,
             display: cfg.display,
+            debug_file: (cfg.debug && conn.method() == "GET")
+                .then(|| conn.form().fields.iget("debug").map(str::to_owned))
+                .flatten(),
             ..AdpState::default()
         };
     }

@@ -8,13 +8,13 @@
 //! to the cache, or destroys it if `ns_markfordelete` was called.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 use std::rc::{Rc, Weak};
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use ns_core::log::Severity;
-use ns_script::{Exception, Interp, ScriptResult};
+use ns_script::{Canceller, Exception, Interp, ScriptEngine, ScriptResult};
 
 use crate::adp::AdpState;
 use crate::conn::{ConnCtx, ConnRef, SetRef, Status};
@@ -113,6 +113,19 @@ pub struct NsInterp {
     /// Set ids handed out for the current connection's form, headers and
     /// output headers (`itPtr->nsconn`).
     pub conn_sets: HashMap<&'static str, String>,
+    /// Channels taken with `ns_chan get`, by shared name
+    /// (`itPtr->chans`).
+    pub chans: BTreeMap<String, RegChan>,
+}
+
+/// A channel an interp took with `ns_chan get` (`NsRegChan`): its
+/// channel name and identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegChan {
+    /// The channel's name in the interp.
+    pub name: String,
+    /// The channel's identity ([`Interp::channel_id`]).
+    pub id: usize,
 }
 
 impl std::fmt::Debug for NsInterp {
@@ -232,7 +245,9 @@ fn create(server: &Arc<Server>) -> Result<Box<dyn Interp>, Exception> {
             epoch: 0,
             defer: Vec::new(),
             conn_sets: HashMap::new(),
+            chans: BTreeMap::new(),
         })));
+    register_thread(&*server.global.engine);
     for (name, cmd) in crate::cmds::core_commands() {
         interp.register(name, Arc::clone(cmd));
     }
@@ -309,6 +324,8 @@ pub fn allocate(server: &Arc<Server>) -> Result<InterpLease, Exception> {
         Some(i) => i,
         None => create(server)?,
     };
+    // Clear any pending async cancel before the allocate traces.
+    interp.invoke_async();
     run_traces(server, &*interp, TraceWhen::Allocate);
     Ok(InterpLease {
         interp: Some(interp),
@@ -352,7 +369,87 @@ pub fn thread_cleanup(global: &crate::global::Global) {
             }
         }
     }
+    unregister_thread();
     global.engine.finalize_thread();
+}
+
+/// Threads that have created interps, with their async cancel handlers
+/// (`threads` in tclinit.c).
+fn threads() -> &'static Mutex<BTreeMap<u64, Arc<dyn Canceller>>> {
+    static THREADS: OnceLock<Mutex<BTreeMap<u64, Arc<dyn Canceller>>>> = OnceLock::new();
+    THREADS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Removes the thread from [`threads`] when it exits.
+struct ThreadEntry(Option<u64>);
+
+impl Drop for ThreadEntry {
+    fn drop(&mut self) {
+        if let Some(tid) = self.0.take() {
+            threads()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&tid);
+        }
+    }
+}
+
+thread_local! {
+    static ENTRY: RefCell<ThreadEntry> = const { RefCell::new(ThreadEntry(None)) };
+}
+
+/// The calling thread's id, as `ns_ictl threads` reports it: the number
+/// in `ns_thread id`'s `ThreadId(N)`.
+pub fn thread_id() -> u64 {
+    let s = format!("{:?}", std::thread::current().id());
+    s.chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Record the calling thread and its async cancel handler (`GetData`).
+fn register_thread(engine: &dyn ScriptEngine) {
+    let _ = ENTRY.try_with(|e| {
+        let mut e = e.borrow_mut();
+        if e.0.is_some() {
+            return;
+        }
+        if let Some(c) = engine.thread_canceller() {
+            let tid = thread_id();
+            threads()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(tid, c);
+            e.0 = Some(tid);
+        }
+    });
+}
+
+fn unregister_thread() {
+    let _ = ENTRY.try_with(|e| drop(std::mem::replace(&mut *e.borrow_mut(), ThreadEntry(None))));
+}
+
+/// The ids of the threads that have created interps (`ns_ictl threads`).
+pub fn active_threads() -> Vec<u64> {
+    threads()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .keys()
+        .copied()
+        .collect()
+}
+
+/// Interrupt the script running in thread `tid` with "async cancel"
+/// (`ns_ictl cancel`).  Returns `false` if the thread has no interps.
+pub fn cancel_thread(tid: u64) -> bool {
+    let c = threads()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&tid)
+        .cloned();
+    c.is_some_and(|c| c.cancel())
 }
 
 /// Run the server's Tcl bootstrap (`NsTclInitServer`): evaluate the init

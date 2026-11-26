@@ -11,6 +11,7 @@ pub mod nsv;
 pub mod register;
 pub mod sched;
 pub mod set;
+pub mod share;
 pub mod thread;
 
 use std::sync::{Arc, OnceLock};

@@ -197,6 +197,110 @@ impl Extensions {
     }
 }
 
+/// The events a variable trace sees (`TCL_TRACE_*` flags).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TraceOps {
+    /// The variable is being read (`TCL_TRACE_READS`).
+    pub reads: bool,
+    /// The variable is being written (`TCL_TRACE_WRITES`).
+    pub writes: bool,
+    /// The variable is being unset (`TCL_TRACE_UNSETS`).
+    pub unsets: bool,
+    /// An `array` subcommand is inspecting it (`TCL_TRACE_ARRAY`).
+    pub array: bool,
+    /// The trace is being removed after this call (`TCL_TRACE_DESTROYED`).
+    pub destroyed: bool,
+    /// The interp is being deleted (`TCL_INTERP_DESTROYED`); the callback
+    /// then gets no interp.
+    pub interp_destroyed: bool,
+}
+
+impl TraceOps {
+    /// Reads, writes, unsets and array operations: everything `ns_share`
+    /// traces.
+    pub const ALL: Self = Self {
+        reads: true,
+        writes: true,
+        unsets: true,
+        array: true,
+        destroyed: false,
+        interp_destroyed: false,
+    };
+}
+
+/// A variable trace callback (`Tcl_VarTraceProc`): called with the interp
+/// (`None` while it is being deleted), the variable name as the script
+/// used it, the array element (if any) and the events.  Traces are
+/// thread-bound like their interp.
+pub type VarTrace = Rc<dyn Fn(Option<&dyn Interp>, &str, Option<&str>, TraceOps)>;
+
+/// Interrupts script evaluation in the thread that created it, the next
+/// time that thread's engine checks for asynchronous events
+/// (`Tcl_AsyncMark` on the handler `ns_ictl cancel` uses).  May be called
+/// from any thread.
+pub trait Canceller: Send + Sync {
+    /// Request the cancellation.  Returns `false` if the thread has
+    /// already released its engine resources.
+    fn cancel(&self) -> bool;
+}
+
+/// An engine channel cut from its interp and thread (`Tcl_CutChannel`),
+/// so that it can be handed to another thread (`ns_chan`).  Only the
+/// engine that detached it can attach or close it again; a detached
+/// channel that is dropped is leaked (it stays open), as in AOLserver.
+pub struct DetachedChannel {
+    engine: &'static str,
+    name: String,
+    id: usize,
+    inner: Box<dyn Any + Send>,
+}
+
+impl fmt::Debug for DetachedChannel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DetachedChannel")
+            .field("engine", &self.engine)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DetachedChannel {
+    /// Wrap an engine's detached channel.  `id` is the channel's identity
+    /// (the same value [`Interp::channel_id`] reports once it is attached).
+    pub fn new(engine: &'static str, name: String, id: usize, inner: Box<dyn Any + Send>) -> Self {
+        Self {
+            engine,
+            name,
+            id,
+            inner,
+        }
+    }
+
+    /// The engine that detached the channel.
+    pub const fn engine(&self) -> &'static str {
+        self.engine
+    }
+
+    /// The channel's name (`Tcl_GetChannelName`).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The channel's identity.
+    pub const fn id(&self) -> usize {
+        self.id
+    }
+
+    /// The engine's own state, for the engine to downcast.
+    pub fn into_inner(self) -> Box<dyn Any + Send> {
+        self.inner
+    }
+}
+
+fn unsupported_by(engine: &str, what: &str) -> Exception {
+    Exception::error(format!("{what} is not supported by the {engine} engine"))
+}
+
 /// An embedded interpreter instance.  See the crate docs for the rules.
 pub trait Interp {
     /// Engine name, e.g. `"tcl"`.
@@ -284,6 +388,119 @@ pub trait Interp {
         let refs: Vec<&str> = items.iter().map(String::as_str).collect();
         self.list_join(&refs)
     }
+
+    /// A number identifying the interp (`ns_conn interp`: the address of
+    /// the `Tcl_Interp`).
+    fn handle(&self) -> usize {
+        std::ptr::from_ref(self).cast::<()>() as usize
+    }
+
+    /// Run any pending asynchronous handlers, discarding their result
+    /// (`Tcl_AsyncInvoke(interp, TCL_OK)`): clears a stale `ns_ictl cancel`
+    /// when the interp is allocated.
+    fn invoke_async(&self) {}
+
+    /// Read `part1` or the element `part1(part2)` (`Tcl_GetVar2Ex` with no
+    /// flags).
+    fn get_var2(&self, part1: &str, part2: Option<&str>) -> Option<String> {
+        match part2 {
+            Some(k) => self.get_var(&format!("{part1}({k})")),
+            None => self.get_var(part1),
+        }
+    }
+
+    /// Set `part1` or the element `part1(part2)` (`Tcl_SetVar2Ex` with no
+    /// flags).
+    fn set_var2(&self, part1: &str, part2: Option<&str>, value: &str) -> Result<(), Exception> {
+        match part2 {
+            Some(k) => self.set_array_elem(part1, k, value),
+            None => self.set_var(part1, value),
+        }
+    }
+
+    /// Trace variable `name` (`Tcl_TraceVar2`).  The callback sees every
+    /// event in `ops`, and always the unset that destroys the trace; `key`
+    /// is reported by [`Interp::var_trace_keys`] to recognise the trace.
+    fn trace_var(
+        &self,
+        name: &str,
+        ops: TraceOps,
+        key: usize,
+        cb: VarTrace,
+    ) -> Result<(), Exception> {
+        let _ = (name, ops, key, cb);
+        Err(unsupported_by(self.engine(), "variable tracing"))
+    }
+
+    /// The keys of the [`Interp::trace_var`] traces on `name`, most
+    /// recently created first (`Tcl_VarTraceInfo`).
+    fn var_trace_keys(&self, name: &str) -> Vec<usize> {
+        let _ = name;
+        Vec::new()
+    }
+
+    /// The identity of the channel `name` registered in this interp, or the
+    /// engine's "can not find channel" error (`Tcl_GetChannel`).
+    fn channel_id(&self, name: &str) -> Result<usize, Exception> {
+        let _ = name;
+        Err(unsupported_by(self.engine(), "channel access"))
+    }
+
+    /// Whether channel `name` is registered in more than one interp
+    /// (`Tcl_IsChannelShared`).
+    fn channel_is_shared(&self, name: &str) -> Result<bool, Exception> {
+        let _ = name;
+        Err(unsupported_by(self.engine(), "channel access"))
+    }
+
+    /// Check that channel `name` is open for writing (`write`) or reading
+    /// (`Ns_TclGetOpenChannel` with `check`).
+    fn channel_check_mode(&self, name: &str, write: bool) -> Result<(), Exception> {
+        let _ = (name, write);
+        Err(unsupported_by(self.engine(), "channel access"))
+    }
+
+    /// Cut channel `name` from this interp and thread (`UnspliceChannel`:
+    /// clear its handlers, unregister it, `Tcl_CutChannel`).
+    fn channel_detach(&self, name: &str) -> Result<DetachedChannel, Exception> {
+        let _ = name;
+        Err(unsupported_by(self.engine(), "channel transfer"))
+    }
+
+    /// Splice a detached channel into this thread and register it in this
+    /// interp (`SpliceChannel`); returns its name.
+    fn channel_attach(&self, chan: DetachedChannel) -> Result<String, Exception> {
+        let _ = chan;
+        Err(unsupported_by(self.engine(), "channel transfer"))
+    }
+
+    /// Unregister channel `name` from this interp if it is still the
+    /// channel `id` (`Tcl_UnregisterChannel`); the last registration
+    /// closes it.
+    fn channel_unregister(&self, name: &str, id: usize) {
+        let _ = (name, id);
+    }
+
+    /// Splice a detached channel into this thread and close it
+    /// (`ns_chan cleanup -shared`).
+    fn channel_close_detached(&self, chan: DetachedChannel) {
+        let _ = chan;
+    }
+
+    /// Write raw bytes to channel `name`, without encoding conversion
+    /// (`Tcl_Write`).
+    fn channel_write(&self, name: &str, data: &[u8]) -> Result<(), Exception> {
+        let _ = (name, data);
+        Err(unsupported_by(self.engine(), "channel access"))
+    }
+
+    /// Wrap a connected socket as a blocking channel registered in this
+    /// interp (`Tcl_MakeTcpClientChannel`); returns its name.  The channel
+    /// owns the socket.
+    fn channel_from_tcp(&self, stream: std::net::TcpStream) -> Result<String, Exception> {
+        drop(stream);
+        Err(unsupported_by(self.engine(), "socket channels"))
+    }
 }
 
 /// A factory for interpreters.
@@ -300,6 +517,13 @@ pub trait ScriptEngine: Send + Sync {
     /// Release per-thread engine resources (`Tcl_FinalizeThread`).  Called
     /// by threads that created interps, just before they exit.
     fn finalize_thread(&self) {}
+
+    /// The calling thread's [`Canceller`], created on first use
+    /// (`Tcl_AsyncCreate`), or `None` if the engine cannot interrupt
+    /// evaluation.
+    fn thread_canceller(&self) -> Option<Arc<dyn Canceller>> {
+        None
+    }
 }
 
 /// Standard "wrong # args" error in Tcl's format.
@@ -574,5 +798,118 @@ mod tests {
         let bytes = vec![0u8, 0x7f, 0x80, 0xff];
         assert_eq!(binary_to_bytes(&bytes_to_binary(&bytes)), bytes);
         assert_eq!(binary_to_bytes("é€"), "é€".as_bytes());
+    }
+
+    /// A minimal engine with only the required methods, to exercise the
+    /// trait's defaults.
+    #[derive(Default)]
+    struct Bare {
+        vars: RefCell<HashMap<String, String>>,
+        ext: Extensions,
+    }
+
+    impl Interp for Bare {
+        fn engine(&self) -> &'static str {
+            "bare"
+        }
+        fn eval(&self, _: &str) -> ScriptResult {
+            Ok(String::new())
+        }
+        fn eval_global(&self, _: &str) -> ScriptResult {
+            Ok(String::new())
+        }
+        fn eval_words(&self, _: &[&str]) -> ScriptResult {
+            Ok(String::new())
+        }
+        fn set_var(&self, name: &str, value: &str) -> Result<(), Exception> {
+            self.vars.borrow_mut().insert(name.into(), value.into());
+            Ok(())
+        }
+        fn get_var(&self, name: &str) -> Option<String> {
+            self.vars.borrow().get(name).cloned()
+        }
+        fn unset_var(&self, name: &str) {
+            self.vars.borrow_mut().remove(name);
+        }
+        fn set_global(&self, name: &str, value: &str) -> Result<(), Exception> {
+            self.set_var(name, value)
+        }
+        fn get_global(&self, name: &str) -> Option<String> {
+            self.get_var(name)
+        }
+        fn set_array_elem(&self, array: &str, key: &str, value: &str) -> Result<(), Exception> {
+            self.set_var(&format!("{array}({key})"), value)
+        }
+        fn list_join(&self, items: &[&str]) -> String {
+            items.join(" ")
+        }
+        fn list_split(&self, list: &str) -> Result<Vec<String>, Exception> {
+            Ok(list.split(' ').map(str::to_owned).collect())
+        }
+        fn register(&self, _: &str, _: Command) {}
+        fn unregister(&self, _: &str) {}
+        fn command_exists(&self, _: &str) -> bool {
+            false
+        }
+        fn ext(&self) -> &Extensions {
+            &self.ext
+        }
+        fn mark_for_delete(&self) {}
+        fn marked_for_delete(&self) -> bool {
+            false
+        }
+    }
+
+    struct BareEngine;
+
+    impl ScriptEngine for BareEngine {
+        fn name(&self) -> &'static str {
+            "bare"
+        }
+        fn version(&self) -> String {
+            "0".into()
+        }
+        fn create_interp(&self) -> Result<Box<dyn Interp>, Exception> {
+            Ok(Box::new(Bare::default()))
+        }
+    }
+
+    #[test]
+    fn trait_defaults() {
+        let e = BareEngine;
+        assert!(e.thread_canceller().is_none());
+        e.finalize_thread();
+        let i = e.create_interp().expect("interp");
+        assert_ne!(i.handle(), 0);
+        i.invoke_async();
+        i.set_var2("a", Some("k"), "1").expect("set");
+        i.set_var2("s", None, "2").expect("set");
+        assert_eq!(i.get_var2("a", Some("k")).as_deref(), Some("1"));
+        assert_eq!(i.get_var2("s", None).as_deref(), Some("2"));
+        let e = i
+            .trace_var("v", TraceOps::ALL, 0, Rc::new(|_, _, _, _| {}))
+            .expect_err("no traces");
+        assert_eq!(
+            e.message,
+            "variable tracing is not supported by the bare engine"
+        );
+        assert_eq!(i.var_trace_keys("v"), Vec::<usize>::new());
+        assert!(i.channel_id("c").is_err());
+        assert!(i.channel_is_shared("c").is_err());
+        assert!(i.channel_check_mode("c", true).is_err());
+        assert!(i.channel_detach("c").is_err());
+        let d = DetachedChannel::new("bare", "c".into(), 3, Box::new(5u8));
+        assert_eq!((d.engine(), d.name(), d.id()), ("bare", "c", 3));
+        assert!(format!("{d:?}").contains("\"c\""));
+        assert_eq!(d.into_inner().downcast::<u8>().ok().map(|b| *b), Some(5));
+        let d = DetachedChannel::new("bare", "c".into(), 3, Box::new(()));
+        assert!(i.channel_attach(d).is_err());
+        i.channel_unregister("c", 0);
+        i.channel_close_detached(DetachedChannel::new("bare", "c".into(), 3, Box::new(())));
+        assert!(i.channel_write("c", b"x").is_err());
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let s = std::net::TcpStream::connect(l.local_addr().expect("addr")).expect("connect");
+        assert!(i.channel_from_tcp(s).is_err());
+        assert!(TraceOps::ALL.unsets && !TraceOps::default().reads);
     }
 }

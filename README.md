@@ -32,6 +32,7 @@ Phase 1 (this release) ports the server core and the most-used modules:
 | ~170 `ns_*` commands (`ns_conn`, `ns_return*`, `ns_set`, `nsv_*`, `ns_cache`, `ns_job`, `ns_thread`, `ns_sched*`, `ns_http`, ...) | ✅ |
 | `nslog` (access log), `nsperm` (Basic auth & permissions), `nscgi` (CGI/1.1) | ✅ |
 | `nsssl` (TLS via rustls), `nszlib`, `nscp` (control port), `nsdb` (SQLite driver), `nsproxy` (worker processes) | ✅ (phase 2) |
+| Channels and shared state: `ns_chan` (cross-thread transfer), `ns_conn channel\|sock\|interp`, `ns_adp_ctl channel`, `ns_adp_debug`, `ns_share`, `ns_ictl cancel` | ✅ (phase 3) |
 | `nsext`/`nspd` | Planned |
 
 See [docs/porting.md](docs/porting.md) for the C-to-Rust map, every

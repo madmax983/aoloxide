@@ -39,6 +39,7 @@ intentional behavioural deviation, and tracks what is not yet ported.
 | `nsd/tclvar.c` | `nsd/src/cmds/nsv.rs` |
 | `nsd/tclmisc.c`, `tclhttp.c`, `tclxkeylist.c`, `tclloop.c`, `tclenv.c`, `tclimg.c`, `tclsock.c` | `nsd/src/cmds/misc.rs` |
 | `nsd/tclfile.c` | `nsd/src/cmds/file.rs` |
+| `nsd/tclfile.c` (`ns_chan`), `tclshare.c` | `nsd/src/cmds/misc.rs`, `cmds/share.rs`; Tcl channel, trace and async API in `ns-tcl/src/extra.rs` |
 | `nsd/modload.c` | `nsd/src/module.rs` |
 | `nsd/nsmain.c`, `main.c`, `unix.c`, `pidfile.c` | `nsd/src/lib.rs`, `aoloxide/src/main.rs` |
 | `nslog/` | `crates/nslog` |
@@ -160,15 +161,39 @@ Modules:
     private protocol descriptors are close-on-exec.  A closing worker is
     reaped by polling for its exit rather than for EOF on its result pipe;
     the `SIGTERM`/`SIGKILL` sequence and its warnings match AOLserver.
+29 (channels). `ns_chan put` refuses a channel that is registered in more
+    than one interp ("channel is shared"), as `ns_chan create` does;
+    AOLserver cut it from under the other interp.  `ns_chan cleanup` and
+    `ns_chan put` find a channel by name and identity, so one the script
+    already closed is skipped (AOLserver used the stale pointer), and
+    `ns_chan get` of a channel whose name the interp already has fails
+    instead of hitting Tcl's duplicate-name panic.  `ns_chan list` returns
+    names in sorted order.
+30 (channels). `ns_conn channel` needs a plain TCP connection: on a TLS
+    connection it fails, and `ns_conn sock` returns -1 there (AOLserver
+    handed out the raw, encrypted socket).  A second `ns_conn channel`
+    fails with "bad file number".
+31 (channels). `ns_ictl threads` reports each thread that created an interp
+    as the number `N` of `ns_thread id`'s `ThreadId(N)`, and `ns_ictl
+    cancel` accepts either form.  When Tcl's event loop runs the cancel
+    handler with no interp it does nothing (AOLserver's `AsyncCancel`
+    dereferenced the NULL interp).
+32 (channels). `ns_share` raises an error where AOLserver called `Ns_Fatal`
+    (a trace that cannot be set, e.g. `ns_share ::nosuch::x`), and the
+    "can't determine existence of variable" error no longer leaves the
+    share table's critical section held.  Shared arrays are copied into
+    an interp in sorted key order.
+33 (channels). The `ns_adp_output` variable that `ns_adp_debug` links to the
+    ADP output buffer is always the global one and is refreshed by a
+    variable trace; writing it restores the buffer's value instead of
+    failing with "linked variable is read-only".
 
 ## Not yet supported (phase 2)
 
 These commands exist but return a clear `not supported` error:
-`ns_share`, `ns_chan` (except `cleanup`/`list`), `ns_conn channel|
-contentchannel|sock|interp`, `ns_sockaccept`, `ns_sockselect`,
+`ns_conn contentchannel`, `ns_sockaccept`, `ns_sockselect`,
 `ns_sockcallback`, `ns_socklisten`, `ns_socklistencallback`,
-`ns_socketpair`, `ns_quewait`, `ns_adp_debug`, `ns_adp_ctl channel`,
-`ns_ictl cancel`.
+`ns_socketpair`, `ns_quewait`.
 
 Modules still to port:
 
@@ -176,8 +201,8 @@ Modules still to port:
 |---|---|
 | `nsext`, `nspd` | external database proxy protocol, as an `nsdb` driver |
 
-Also planned: spooling large uploads to temp files, `ns_sockcallback` on
-the tokio runtime, and channel transfer for `ns_chan`.
+Also planned: spooling large uploads to temp files, and `ns_sockcallback`
+on the tokio runtime.
 
 ## Formal verification
 
@@ -189,6 +214,7 @@ the tokio runtime, and channel transfer for `ns_chan`.
 | `glob.rs` | an executable `*`/`?` matcher equals the recursive spec; literal and `*` lemmas |
 | `pool.rs` | pool transitions keep `idle ≤ current ≤ max`; enqueue never strands work while there is capacity |
 | `cache.rs` | inserts keep total size ≤ max; eviction removes only LRU entries |
+| `chan.rs` | `ns_chan` ownership: a channel is registered in some interp, held by the server's shared table, or closed, never two of these; `create`/`put` cut only an unshared channel, `get` gives it to exactly one interp |
 | `proxy.rs` | nsproxy handle accounting (`avail + out = max`, idle workers ≤ spare capacity under any interleaving of get, release and config, including a config between a failed `get`'s pops and its give-back; a failed `get` restores the pool) and the `Idle → Busy → Done → Idle` proxy state machine |
 
 The production implementations are additionally checked against the same

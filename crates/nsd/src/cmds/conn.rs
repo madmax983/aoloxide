@@ -124,6 +124,45 @@ const CONN_OPTS: &[&str] = &[
     "interp",
 ];
 
+/// The connection's socket descriptor, or -1 once it is gone or when it
+/// is not a plain TCP socket (`Ns_ConnSock`).
+fn conn_sock(c: &ConnRef) -> i32 {
+    use std::os::fd::AsRawFd;
+    c.conn()
+        .sock
+        .as_ref()
+        .and_then(|s| (*s.stream).tcp().map(AsRawFd::as_raw_fd))
+        .unwrap_or(-1)
+}
+
+/// `ns_conn channel` (`MakeConnChannel` with `spliceout`): flush queued
+/// output, then hand the connection's socket to a new blocking Tcl channel
+/// registered in the interp.  The connection no longer owns the socket:
+/// later writes to the connection fail and the driver forgets it.
+fn conn_channel(interp: &dyn Interp, c: &ConnRef) -> ScriptResult {
+    let _ = c.send(&[]);
+    let plain = {
+        let cc = c.conn();
+        let Some(sock) = cc.sock.as_ref() else {
+            return Err(Exception::error("bad file number"));
+        };
+        (*sock.stream).tcp().is_some()
+    };
+    if !plain {
+        return Err(Exception::error(
+            "ns_conn channel: the connection is not a plain TCP socket",
+        ));
+    }
+    let Some(crate::driver::Sock { stream, .. }) = c.conn_mut().sock.take() else {
+        return Err(Exception::error("bad file number"));
+    };
+    let tcp = <dyn crate::driver::ConnStream>::into_tcp(stream)
+        .map_err(|_| Exception::error("bad file number"))?
+        .into_std()
+        .map_err(|e| Exception::error(e.to_string()))?;
+    interp.channel_from_tcp(tcp)
+}
+
 fn ns_conn(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     let argv = strip_connid(argv);
     let (_, opt) = super::subcommand(&argv, CONN_OPTS)?;
@@ -178,12 +217,15 @@ fn ns_conn(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
             write_channel(interp, &chan, &data)?;
             String::new()
         }
-        "channel" | "contentchannel" | "sock" | "interp" => {
+        "contentchannel" => {
             return Err(Exception::error(format!(
                 "ns_conn {opt}: not supported by the {} engine bridge",
                 interp.engine()
             )))
         }
+        "channel" => conn_channel(interp, &c)?,
+        "sock" => conn_sock(&c).to_string(),
+        "interp" => interp.handle().to_string(),
         "driver" => c.conn().driver.name.clone(),
         "encoding" | "urlencoding" => {
             if let Some(cs) = arg(2) {

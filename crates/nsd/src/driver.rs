@@ -29,8 +29,30 @@ use crate::global::{Global, NsError};
 use crate::server::Server;
 
 /// A client byte stream (plain TCP or TLS).
-pub trait ConnStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> ConnStream for T {}
+pub trait ConnStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+    /// The plain TCP socket, if this stream is one (`ns_conn sock`).
+    fn tcp(&self) -> Option<&TcpStream>;
+    /// Unwrap the plain TCP socket, or give the stream back
+    /// (`ns_conn channel`).
+    fn into_tcp(self: Box<Self>) -> Result<TcpStream, Box<dyn ConnStream>>;
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> ConnStream for T {
+    fn tcp(&self) -> Option<&TcpStream> {
+        (self as &dyn std::any::Any).downcast_ref()
+    }
+
+    fn into_tcp(self: Box<Self>) -> Result<TcpStream, Box<dyn ConnStream>> {
+        if (&*self as &dyn std::any::Any).is::<TcpStream>() {
+            let any: Box<dyn std::any::Any> = self;
+            Ok(*any
+                .downcast::<TcpStream>()
+                .unwrap_or_else(|_| unreachable!("checked above")))
+        } else {
+            Err(self)
+        }
+    }
+}
 
 /// Boxed future returned by [`StreamWrapper::wrap`].
 pub type WrapFuture = Pin<Box<dyn Future<Output = io::Result<Box<dyn ConnStream>>> + Send>>;
@@ -714,6 +736,26 @@ impl WrapperRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_plain_tcp_streams_unwrap() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let other: Box<dyn ConnStream> = Box::new(tokio::io::duplex(8).0);
+            assert!((*other).tcp().is_none());
+            assert!(<dyn ConnStream>::into_tcp(other).is_err());
+            let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let c = TcpStream::connect(l.local_addr().expect("addr"))
+                .await
+                .expect("connect");
+            let plain: Box<dyn ConnStream> = Box::new(c);
+            assert!((*plain).tcp().is_some());
+            assert!(<dyn ConnStream>::into_tcp(plain).is_ok());
+        });
+    }
 
     fn info() -> DriverInfo {
         let mut c = Config::new();

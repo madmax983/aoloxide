@@ -78,7 +78,7 @@ pub fn commands() -> Vec<(&'static str, Command)> {
         ("ns_socklistencallback", cmd(unsupported)),
         ("ns_socketpair", cmd(unsupported)),
         ("ns_chan", cmd(ns_chan)),
-        ("ns_share", cmd(unsupported)),
+        ("ns_share", cmd(super::share::ns_share)),
         ("ns_quewait", cmd(unsupported)),
         ("ns_checkurl", cmd(ns_checkurl)),
         ("ns_puts", cmd(super::adp::ns_adp_puts)),
@@ -1103,13 +1103,107 @@ fn ns_socklisten(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     ))
 }
 
-fn ns_chan(_interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    let (_, opt) = super::subcommand(argv, &["cleanup", "create", "get", "list", "put"])?;
+/// `ns_chan cleanup|list|create|put|get` (`NsTclChanObjCmd`): move
+/// channels between interps and threads through the server's shared
+/// table.  See `verus/chan.rs` for the ownership invariant.
+fn ns_chan(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
+    if argv.len() < 2 {
+        return Err(wrong_args(argv, 1, "command ?args?"));
+    }
+    let opts = ["cleanup", "list", "create", "put", "get"];
+    let opt = opts[ns_script::get_index(&argv[1], &opts, "option")?];
+    let srv = server(interp)?;
+    let st = crate::interp::ns_interp(interp)?;
+    let lock_chans = || srv.chans.lock().unwrap_or_else(PoisonError::into_inner);
     match opt {
-        "cleanup" | "list" => Ok(String::new()),
-        _ => Err(Exception::error(format!(
-            "ns_chan {opt}: sharing channels between interps is not supported"
-        ))),
+        "create" => {
+            if argv.len() != 4 {
+                return Err(wrong_args(argv, 1, "create channel name"));
+            }
+            if interp.channel_is_shared(&argv[2])? {
+                return Err(Exception::error("channel is shared"));
+            }
+            let mut table = lock_chans();
+            if table.contains_key(&argv[3]) {
+                return Err(Exception::error(format!(
+                    "channel with name \"{}\" already exists",
+                    argv[3]
+                )));
+            }
+            let det = interp.channel_detach(&argv[2])?;
+            table.insert(argv[3].clone(), det);
+            Ok(String::new())
+        }
+        "get" => {
+            if argv.len() != 3 {
+                return Err(wrong_args(argv, 1, "get name"));
+            }
+            let name = &argv[2];
+            let det = lock_chans()
+                .remove(name)
+                .ok_or_else(|| Exception::error(format!("no such shared channel: {name}")))?;
+            let id = det.id();
+            let cname = interp.channel_attach(det)?;
+            st.borrow_mut().chans.insert(
+                name.clone(),
+                crate::interp::RegChan {
+                    name: cname.clone(),
+                    id,
+                },
+            );
+            Ok(cname)
+        }
+        "put" => {
+            if argv.len() != 3 {
+                return Err(wrong_args(argv, 1, "put name"));
+            }
+            let name = &argv[2];
+            let reg = st
+                .borrow()
+                .chans
+                .get(name)
+                .cloned()
+                .ok_or_else(|| Exception::error(format!("no such shared channel: {name}")))?;
+            if interp.channel_id(&reg.name).ok() != Some(reg.id) {
+                st.borrow_mut().chans.remove(name);
+                return Err(Exception::error("channel mismatch"));
+            }
+            // Deviation: a channel registered in another interp too (e.g.
+            // with `interp share`) is not cut from under it.
+            if interp.channel_is_shared(&reg.name)? {
+                return Err(Exception::error("channel is shared"));
+            }
+            let det = interp.channel_detach(&reg.name)?;
+            st.borrow_mut().chans.remove(name);
+            lock_chans().insert(name.clone(), det);
+            Ok(String::new())
+        }
+        _ => {
+            if argv.len() != 2 && argv.len() != 3 {
+                return Err(wrong_args(argv, 1, &format!("{opt} ?-shared?")));
+            }
+            let shared = argv.len() == 3;
+            if opt == "list" {
+                let names: Vec<String> = if shared {
+                    lock_chans().keys().cloned().collect()
+                } else {
+                    st.borrow().chans.keys().cloned().collect()
+                };
+                return Ok(interp.list_from(&names));
+            }
+            if shared {
+                let all = std::mem::take(&mut *lock_chans());
+                for det in all.into_values() {
+                    interp.channel_close_detached(det);
+                }
+            } else {
+                let all = std::mem::take(&mut st.borrow_mut().chans);
+                for reg in all.into_values() {
+                    interp.channel_unregister(&reg.name, reg.id);
+                }
+            }
+            Ok(String::new())
+        }
     }
 }
 
