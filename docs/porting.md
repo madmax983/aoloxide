@@ -37,7 +37,11 @@ intentional behavioural deviation, and tracks what is not yet ported.
 | `nsd/tcljob.c` | `nsd/src/job.rs`, `cmds/thread.rs` |
 | `nsd/tclthread.c`, `nsthread/` | `nsd/src/sync.rs`, `cmds/thread.rs` (std threads) |
 | `nsd/tclvar.c` | `nsd/src/cmds/nsv.rs` |
-| `nsd/tclmisc.c`, `tclhttp.c`, `tclxkeylist.c`, `tclloop.c`, `tclenv.c`, `tclimg.c`, `tclsock.c` | `nsd/src/cmds/misc.rs` |
+| `nsd/tclmisc.c`, `tclhttp.c`, `tclxkeylist.c`, `tclloop.c`, `tclenv.c`, `tclimg.c` | `nsd/src/cmds/misc.rs` |
+| `nsd/tclsock.c` | `nsd/src/cmds/sock.rs` (DNS commands in `cmds/misc.rs`) |
+| `nsd/sock.c` | `nsd/src/sock.rs` |
+| `nsd/sockcallback.c`, `listen.c` | `nsd/src/sockcallback.rs` |
+| `Ns_QueueWait`, `RunQueWaits` (`nsd/driver.c`) | `nsd/src/quewait.rs` |
 | `nsd/tclfile.c` | `nsd/src/cmds/file.rs` |
 | `nsd/modload.c` | `nsd/src/module.rs` |
 | `nsd/nsmain.c`, `main.c`, `unix.c`, `pidfile.c` | `nsd/src/lib.rs`, `aoloxide/src/main.rs` |
@@ -90,9 +94,7 @@ Server behaviour:
 
 Script API:
 
-12. `ns_sockopen` returns the same bidirectional Tcl channel twice
-    (`[list $chan $chan]`).
-13. `ns_info threads|locks|callbacks|sockcallbacks` return empty lists, and
+13. `ns_info threads|locks|callbacks` return empty lists, and
     `ns_server active|all|keepalive` report minimal information.
 14. `ns_thread name` reports but cannot rename the current thread.
 15. `ns_http`/`ns_geturl` support plain `http://` only.
@@ -161,13 +163,39 @@ Modules:
     reaped by polling for its exit rather than for EOF on its result pipe;
     the `SIGTERM`/`SIGKILL` sequence and its warnings match AOLserver.
 
+29 (sockets). **`ns_quewait`** waits are polled in the connection
+    thread, between the pre-queue and read filters, because pre-queue
+    filters run there (item 7); waits may be registered only while
+    pre-queue filters and queue-wait callbacks run (AOLserver: only in the
+    driver thread), otherwise the command fails with "could not register
+    sock wait" and logs "attempt to register quewait outside driver
+    thread".  The timeout is relative to the call.  AOLserver stored the
+    relative time where the driver expected an absolute one, so every wait
+    timed out at once unless its socket was already ready.  As in
+    AOLserver, input from the client while waiting counts as a drop: the
+    callbacks get `dropped` and the connection closes without a response.
+30 (sockets). Socket descriptors made by the socket commands are
+    close-on-exec, including the duplicates made by `ns_sockopen`,
+    `ns_sockaccept`, listen callbacks and `ns_sockcallback` (AOLserver's
+    `ns_sockdup` left them inheritable).  `ns_sockselect` uses `poll(2)`
+    (no `FD_SETSIZE` limit), reporting what `select(2)` reports: readable
+    includes hang-up and error, writable includes error.  OS errors are
+    the system's `strerror` text in lower case, which can differ in
+    wording from `Tcl_PosixError`.  A Tcl socket callback cancelled or
+    replaced through the C-level API (`SockCallbacks::cancel`, or a new
+    registration for the same descriptor) closes its descriptor and
+    channel; AOLserver leaked them.
+31 (sockets). `ns_info sockcallbacks` lists the callback thread's table
+    as of its last pass (AOLserver read the table while the thread could
+    change it), so a new registration appears once the thread has woken.
+    The callback thread waits for startup to complete, or for shutdown to
+    begin (AOLserver waited for startup only).
+
 ## Not yet supported (phase 2)
 
 These commands exist but return a clear `not supported` error:
 `ns_share`, `ns_chan` (except `cleanup`/`list`), `ns_conn channel|
-contentchannel|sock|interp`, `ns_sockaccept`, `ns_sockselect`,
-`ns_sockcallback`, `ns_socklisten`, `ns_socklistencallback`,
-`ns_socketpair`, `ns_quewait`, `ns_adp_debug`, `ns_adp_ctl channel`,
+contentchannel|sock|interp`, `ns_adp_debug`, `ns_adp_ctl channel`,
 `ns_ictl cancel`.
 
 Modules still to port:
@@ -176,8 +204,8 @@ Modules still to port:
 |---|---|
 | `nsext`, `nspd` | external database proxy protocol, as an `nsdb` driver |
 
-Also planned: spooling large uploads to temp files, `ns_sockcallback` on
-the tokio runtime, and channel transfer for `ns_chan`.
+Also planned: spooling large uploads to temp files, and channel transfer
+for `ns_chan`.
 
 ## Formal verification
 
@@ -190,6 +218,7 @@ the tokio runtime, and channel transfer for `ns_chan`.
 | `pool.rs` | pool transitions keep `idle ≤ current ≤ max`; enqueue never strands work while there is capacity |
 | `cache.rs` | inserts keep total size ≤ max; eviction removes only LRU entries |
 | `proxy.rs` | nsproxy handle accounting (`avail + out = max`, idle workers ≤ spare capacity under any interleaving of get, release and config, including a config between a failed `get`'s pops and its give-back; a failed `get` restores the pool) and the `Idle → Busy → Done → Idle` proxy state machine |
+| `sockcallback.rs` | socket callback registry accounting (`queued + active + done + released = accepted`, nothing held once stopped), registrations refused once shutdown is pending so `stop` releases every callback, and the `Queued → Active → Done → Released` callback life cycle: never called after returning false or being released |
 
 The production implementations are additionally checked against the same
 specifications by property tests (`proptest`).

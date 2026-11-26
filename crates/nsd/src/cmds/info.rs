@@ -79,7 +79,22 @@ fn ns_info(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         "argv0" => g.info.argv0.clone(),
         "boottime" => g.info.boot_time.to_string(),
         "builddate" | "label" | "tag" => g.info.build.clone(),
-        "callbacks" | "locks" | "sockcallbacks" | "threads" => String::new(),
+        "callbacks" | "locks" | "threads" => String::new(),
+        "sockcallbacks" => {
+            let items: Vec<String> = g
+                .socks
+                .callbacks()
+                .iter()
+                .map(|cb| {
+                    let fd = cb.fd.to_string();
+                    let when = interp.list_join(&cb.when_names());
+                    let mut words = vec![fd.as_str(), when.as_str()];
+                    words.extend(cb.info.iter().map(String::as_str));
+                    interp.list_join(&words)
+                })
+                .collect();
+            interp.list_from(&items)
+        }
         "config" => g
             .info
             .config_file

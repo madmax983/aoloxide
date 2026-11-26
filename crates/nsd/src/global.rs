@@ -15,6 +15,7 @@ use crate::job::JobRegistry;
 use crate::pool::PoolRegistry;
 use crate::sched::Scheduler;
 use crate::server::Server;
+use crate::sockcallback::SockCallbacks;
 use crate::sync::SyncRegistry;
 use crate::tclcache::CacheRegistry;
 
@@ -118,6 +119,7 @@ pub struct State {
 impl State {
     /// Mark the server started.
     pub fn set_started(&self) {
+        let _g = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.started.store(true, Ordering::SeqCst);
         self.cond.notify_all();
     }
@@ -162,6 +164,25 @@ impl State {
         }
         true
     }
+
+    /// Block until startup completes, shutdown is requested or `timeout`
+    /// elapses (`Ns_WaitForStartup`, bounded).  Returns whether started.
+    pub fn wait_started(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut g = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while !self.started() && !self.stopping() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            g = self
+                .cond
+                .wait_timeout(g, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        self.started()
+    }
 }
 
 /// All process-wide state.  Shared by every server, driver and thread.
@@ -192,6 +213,8 @@ pub struct Global {
     pub sync: SyncRegistry,
     /// Run state.
     pub state: State,
+    /// Socket callbacks (`Ns_SockCallback`, the `-socks-` thread).
+    pub socks: SockCallbacks,
     /// Async I/O runtime used by drivers and socket callbacks.
     pub runtime: tokio::runtime::Handle,
     /// Virtual servers by name (weak to avoid cycles).
@@ -328,6 +351,7 @@ impl Global {
             jobs: JobRegistry::default(),
             sync: SyncRegistry::default(),
             state: State::default(),
+            socks: SockCallbacks::new(weak.clone()),
             runtime: opts.runtime,
             servers: RwLock::new(Vec::new()),
             next_conn_id: AtomicU64::new(1),

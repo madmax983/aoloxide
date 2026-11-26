@@ -202,6 +202,8 @@ pub struct Conn {
     pub limits: Option<Arc<Limits>>,
     /// Pool name the request ran in.
     pub pool: String,
+    /// Pre-queue I/O waits (`ns_quewait`).
+    pub que_waits: crate::quewait::QueWaits,
 }
 
 impl std::fmt::Debug for Conn {

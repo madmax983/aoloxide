@@ -284,6 +284,52 @@ pub trait Interp {
         let refs: Vec<&str> = items.iter().map(String::as_str).collect();
         self.list_join(&refs)
     }
+
+    /// The OS descriptor behind channel `chan` (`Ns_TclGetOpenFd`): the
+    /// channel must be open for writing when `write` is true, otherwise
+    /// for reading.  Engines without OS-level channels return an error.
+    fn channel_fd(&self, chan: &str, write: bool) -> Result<i32, Exception> {
+        let _ = write;
+        Err(Exception::error(format!(
+            "channel \"{chan}\": descriptors are not supported by the {} engine",
+            self.engine()
+        )))
+    }
+
+    /// Bytes of input the engine has buffered for `chan`
+    /// (`Tcl_InputBuffered`).
+    fn channel_buffered(&self, chan: &str) -> Result<usize, Exception> {
+        Err(Exception::error(format!(
+            "channel \"{chan}\": buffers are not supported by the {} engine",
+            self.engine()
+        )))
+    }
+
+    /// Wrap the connected socket `fd` in a new binary-mode channel
+    /// registered in this interp and return its name (AOLserver's
+    /// `EnterSock`).  The channel owns `fd`; on failure `fd` is closed.
+    fn socket_channel(&self, fd: i32) -> ScriptResult {
+        close_fd(fd);
+        Err(Exception::error("could not open socket"))
+    }
+
+    /// Register a channel held by this thread (see
+    /// [`ScriptEngine::hold_socket`]) in this interp, so scripts can use it
+    /// by name (`Tcl_RegisterChannel(interp, chan)`).
+    fn attach_held_channel(&self, chan: &str) -> Result<(), Exception> {
+        Err(Exception::error(format!(
+            "can not find channel named \"{chan}\""
+        )))
+    }
+}
+
+/// Close a descriptor whose ownership was handed to an engine that cannot
+/// use it.
+pub fn close_fd(fd: i32) {
+    if fd >= 0 {
+        // SAFETY: callers pass a descriptor they own and will not use again.
+        drop(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    }
 }
 
 /// A factory for interpreters.
@@ -300,6 +346,27 @@ pub trait ScriptEngine: Send + Sync {
     /// Release per-thread engine resources (`Tcl_FinalizeThread`).  Called
     /// by threads that created interps, just before they exit.
     fn finalize_thread(&self) {}
+
+    /// Wrap the connected socket `fd` in a binary-mode channel held by the
+    /// calling thread rather than by an interp (`Tcl_RegisterChannel(NULL,
+    /// chan)`), and return its name.  The channel survives the interps it
+    /// is attached to with [`Interp::attach_held_channel`] until
+    /// [`ScriptEngine::release_held`].  The channel owns `fd`; on failure
+    /// `fd` is closed.
+    fn hold_socket(&self, fd: i32) -> Result<String, Exception> {
+        close_fd(fd);
+        Err(Exception::error(format!(
+            "could not make channel for sock: {fd}"
+        )))
+    }
+
+    /// Drop this thread's hold on channel `chan`
+    /// (`Tcl_UnregisterChannel(NULL, chan)`), closing it unless an interp
+    /// still has it registered.  Returns whether the thread held it.
+    fn release_held(&self, chan: &str) -> bool {
+        let _ = chan;
+        false
+    }
 }
 
 /// Standard "wrong # args" error in Tcl's format.
@@ -574,5 +641,100 @@ mod tests {
         let bytes = vec![0u8, 0x7f, 0x80, 0xff];
         assert_eq!(binary_to_bytes(&bytes_to_binary(&bytes)), bytes);
         assert_eq!(binary_to_bytes("é€"), "é€".as_bytes());
+    }
+
+    /// An engine with no channels, to exercise the trait defaults.
+    struct Bare(Extensions);
+
+    impl Interp for Bare {
+        fn engine(&self) -> &'static str {
+            "bare"
+        }
+        fn eval(&self, _: &str) -> ScriptResult {
+            Ok(String::new())
+        }
+        fn eval_global(&self, _: &str) -> ScriptResult {
+            Ok(String::new())
+        }
+        fn eval_words(&self, _: &[&str]) -> ScriptResult {
+            Ok(String::new())
+        }
+        fn set_var(&self, _: &str, _: &str) -> Result<(), Exception> {
+            Ok(())
+        }
+        fn get_var(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn unset_var(&self, _: &str) {}
+        fn set_global(&self, _: &str, _: &str) -> Result<(), Exception> {
+            Ok(())
+        }
+        fn get_global(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn set_array_elem(&self, _: &str, _: &str, _: &str) -> Result<(), Exception> {
+            Ok(())
+        }
+        fn list_join(&self, items: &[&str]) -> String {
+            items.join(" ")
+        }
+        fn list_split(&self, list: &str) -> Result<Vec<String>, Exception> {
+            Ok(list.split_whitespace().map(str::to_owned).collect())
+        }
+        fn register(&self, _: &str, _: Command) {}
+        fn unregister(&self, _: &str) {}
+        fn command_exists(&self, _: &str) -> bool {
+            false
+        }
+        fn ext(&self) -> &Extensions {
+            &self.0
+        }
+        fn mark_for_delete(&self) {}
+        fn marked_for_delete(&self) -> bool {
+            false
+        }
+    }
+
+    struct BareEngine;
+
+    impl ScriptEngine for BareEngine {
+        fn name(&self) -> &'static str {
+            "bare"
+        }
+        fn version(&self) -> String {
+            "0".into()
+        }
+        fn create_interp(&self) -> Result<Box<dyn Interp>, Exception> {
+            Ok(Box::new(Bare(Extensions::default())))
+        }
+    }
+
+    fn pipe() -> [i32; 2] {
+        use std::os::fd::IntoRawFd;
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        [a.into_raw_fd(), b.into_raw_fd()]
+    }
+
+    #[test]
+    fn channel_defaults_without_engine_support() {
+        let e = BareEngine;
+        let i = e.create_interp().expect("interp");
+        assert!(i
+            .channel_fd("c", true)
+            .expect_err("fd")
+            .message
+            .contains("not supported by the bare engine"));
+        assert!(i.channel_buffered("c").is_err());
+        assert!(i.attach_held_channel("c").is_err());
+        let [a, b] = pipe();
+        assert_eq!(
+            i.socket_channel(a).expect_err("socket").message,
+            "could not open socket"
+        );
+        assert!(e.hold_socket(b).is_err());
+        assert!(!e.release_held("c"));
+        e.finalize_thread();
+        close_fd(-1);
+        assert_eq!(i.list_from(&["a".into(), "b".into()]), "a b");
     }
 }

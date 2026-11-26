@@ -1,7 +1,8 @@
 //! Miscellaneous commands: logging, time, encoding, HTML helpers, keyed
-//! lists, loops, environment, HTTP client, sockets and channels
+//! lists, loops, environment, HTTP client, DNS and channels
 //! (`nsd/tclmisc.c`, `tclhttp.c`, `tclxkeylist.c`, `tclloop.c`, `tclenv.c`,
-//! `tclsock.c`, `tclimg.c`).
+//! `tclimg.c`, and the DNS commands of `tclsock.c`).  The socket commands
+//! are in [`super::sock`].
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -66,20 +67,8 @@ pub fn commands() -> Vec<(&'static str, Command)> {
         ("keylkeys", cmd(keylkeys)),
         ("ns_geturl", cmd(ns_geturl)),
         ("ns_http", cmd(ns_http)),
-        ("ns_sockopen", cmd(ns_sockopen)),
-        ("ns_sockblocking", cmd(|i, a| sock_blocking(i, a, true))),
-        ("ns_socknonblocking", cmd(|i, a| sock_blocking(i, a, false))),
-        ("ns_socknread", cmd(ns_socknread)),
-        ("ns_sockcheck", cmd(ns_sockcheck)),
-        ("ns_socklisten", cmd(ns_socklisten)),
-        ("ns_sockaccept", cmd(unsupported)),
-        ("ns_sockselect", cmd(unsupported)),
-        ("ns_sockcallback", cmd(unsupported)),
-        ("ns_socklistencallback", cmd(unsupported)),
-        ("ns_socketpair", cmd(unsupported)),
         ("ns_chan", cmd(ns_chan)),
         ("ns_share", cmd(unsupported)),
-        ("ns_quewait", cmd(unsupported)),
         ("ns_checkurl", cmd(ns_checkurl)),
         ("ns_puts", cmd(super::adp::ns_adp_puts)),
     ]
@@ -1042,66 +1031,7 @@ fn ns_http(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     }
 }
 
-// ---- sockets & channels (via the engine's own socket channels) ----
-
-fn ns_sockopen(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    let mut a: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-    let nonblock = a.first() == Some(&"-nonblock");
-    if nonblock {
-        a.remove(0);
-    }
-    let mut timeout = None;
-    if a.first() == Some(&"-timeout") && a.len() > 1 {
-        timeout = Some(a[1].to_owned());
-        a.drain(..2);
-    }
-    if a.len() != 2 {
-        return Err(wrong_args(
-            argv,
-            1,
-            "?-nonblock|-timeout seconds? host port",
-        ));
-    }
-    let _ = timeout;
-    let mut words = vec!["socket"];
-    if nonblock {
-        words.push("-async");
-    }
-    words.push(a[0]);
-    words.push(a[1]);
-    let chan = interp.eval_words(&words)?;
-    Ok(interp.list_join(&[&chan, &chan]))
-}
-
-fn sock_blocking(interp: &dyn Interp, argv: &[String], blocking: bool) -> ScriptResult {
-    check_args(argv, 2, 2, 1, "sockId")?;
-    interp.eval_words(&[
-        "fconfigure",
-        &argv[1],
-        "-blocking",
-        if blocking { "1" } else { "0" },
-    ])?;
-    Ok(String::new())
-}
-
-fn ns_socknread(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    check_args(argv, 2, 2, 1, "sockId")?;
-    interp.eval_words(&["chan", "pending", "input", &argv[1]])
-}
-
-fn ns_sockcheck(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    check_args(argv, 2, 2, 1, "sockId")?;
-    let err = interp.eval_words(&["fconfigure", &argv[1], "-error"])?;
-    Ok(bool_str(err.is_empty()))
-}
-
-fn ns_socklisten(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    check_args(argv, 3, 3, 1, "address port")?;
-    let _ = interp;
-    Err(Exception::error(
-        "ns_socklisten: use the engine's [socket -server] with a callback; blocking listen sockets are not supported",
-    ))
-}
+// ---- channels ----
 
 fn ns_chan(_interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     let (_, opt) = super::subcommand(argv, &["cleanup", "create", "get", "list", "put"])?;

@@ -67,6 +67,13 @@ classDiagram
 * Commands that need engine-specific objects (Tcl channels for
   `ns_sockopen`, `ns_returnfp`, `ns_conn copy`) go through the engine's own
   commands via `eval_words` (`read`, `puts`, `fconfigure`, `socket`).
-  Features that need the C channel API directly (`ns_chan` transfer between
-  interps, `ns_conn channel`) are not available through the trait yet.
+  Socket commands use a few channel methods on the traits: the descriptor
+  behind a channel (`Interp::channel_fd`), buffered input
+  (`channel_buffered`), wrapping a socket in a new channel
+  (`socket_channel`), and channels held by a thread rather than an interp
+  (`ScriptEngine::hold_socket`, `Interp::attach_held_channel`,
+  `ScriptEngine::release_held`) for socket callbacks, whose channel lives
+  on the callback thread across the interps that use it.  Other features
+  that need the C channel API directly (`ns_chan` transfer between interps,
+  `ns_conn channel`) are not available through the trait yet.
 * Building requires Tcl 8.6 development files.

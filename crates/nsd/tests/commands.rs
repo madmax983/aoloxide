@@ -797,15 +797,314 @@ fn adp_commands() {
 #[test]
 fn unsupported_commands_fail_clearly() {
     let srv = TestServer::start("", |_| {});
-    for c in [
-        "ns_share x",
-        "ns_sockselect",
-        "ns_sockcallback",
-        "ns_quewait",
-        "ns_ictl cancel 1",
-    ] {
+    for c in ["ns_share x", "ns_ictl cancel 1"] {
         err(&srv, c, "not supported");
     }
     err(&srv, "ns_conn url", "no connection");
     ok(&srv, "ns_conn isconnected", "0");
+}
+
+/// Evaluate `script` until it returns `want` (callbacks run on other
+/// threads), failing after 10 seconds.
+fn eventually(srv: &TestServer, script: &str, want: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let got = eval(srv, script);
+        if got.as_deref() == Ok(want) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "script: {script}\n  got {got:?}, want {want:?}\n  log: {:?}",
+            srv.log()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[test]
+fn socket_channels() {
+    let srv = TestServer::start("", |_| {});
+    // ns_socketpair: two connected binary channels.
+    ok(&srv, "set p [ns_socketpair]; foreach {a b} $p break; puts $a hello; flush $a; set r [list [llength $p] [gets $b] [fconfigure $a -translation]]; close $a; close $b; set r", "2 hello {lf lf}");
+    ok(&srv, "foreach {a b} [ns_socketpair] break; ns_socknonblocking $a; set r [fconfigure $a -blocking]; ns_sockblocking $a; lappend r [fconfigure $a -blocking]; close $a; close $b; set r", "0 1");
+    err(&srv, "ns_sockblocking", "wrong # args");
+    err(
+        &srv,
+        "ns_sockblocking nosuch",
+        "can not find channel named \"nosuch\"",
+    );
+    // ns_sockselect: writable now, readable once data arrives, buffered
+    // input counts as readable, timeouts return three empty lists.
+    ok(&srv, "foreach {a b} [ns_socketpair] break; set r [ns_sockselect -timeout 0 [list $b] [list $a] [list $b]]; set r [list [lindex $r 0] [expr {[lindex $r 1] eq $a}] [lindex $r 2]]; close $a; close $b; set r", "{} 1 {}");
+    ok(&srv, "foreach {a b} [ns_socketpair] break; puts $a x; flush $a; set r [ns_sockselect -timeout 5 [list $a $b] {} {}]; set r [expr {[lindex $r 0] eq $b}]; close $a; close $b; set r", "1");
+    ok(&srv, "foreach {a b} [ns_socketpair] break; puts -nonewline $a \"x\\ny\\n\"; flush $a; gets $b; set r [ns_sockselect [list $b $a] {} {}]; set r [expr {[lindex $r 0] eq $b}]; close $a; close $b; set r", "1");
+    ok(&srv, "foreach {a b} [ns_socketpair] break; set r [ns_sockselect -timeout 0:1000 [list $b] {} {}]; close $a; close $b; set r", "{} {} {}");
+    ok(&srv, "ns_sockselect {} {} {}", "");
+    ok(&srv, "ns_sockselect -timeout 0 {} {} {}", "{} {} {}");
+    err(&srv, "ns_sockselect -bogus 1 {} {} {}", "wrong # args");
+    err(&srv, "ns_sockselect {} {}", "wrong # args");
+    err(&srv, "ns_sockselect nosuch {} {}", "can not find channel");
+    err(&srv, "ns_sockselect -timeout x {} {} {}", "expected");
+    err(&srv, "set f [open [info nameofexecutable]]; catch {ns_sockselect {} $f {}} m; close $f; error $m", "not open for write");
+    // ns_socknread: kernel bytes plus Tcl's buffer.
+    ok(&srv, "foreach {a b} [ns_socketpair] break; puts -nonewline $a abc; flush $a; ns_sockselect -timeout 5 $b {} {}; set r [ns_socknread $b]; read $b 1; lappend r [ns_socknread $b]; close $a; close $b; set r", "3 2");
+    err(&srv, "ns_socknread", "wrong # args");
+    err(&srv, "ns_socknread nosuch", "can not find channel");
+    // ns_socklisten, ns_sockopen, ns_sockaccept, ns_sockcheck.
+    ok(
+        &srv,
+        r"
+        set l [ns_socklisten 127.0.0.1 0]
+        set port [lindex [fconfigure $l -sockname] 2]
+        set c [ns_sockopen 127.0.0.1 $port]
+        set s [ns_sockaccept $l]
+        puts [lindex $c 1] ping; flush [lindex $c 1]
+        set r [list [llength $c] [llength $s] [expr {[lindex $s 0] ne [lindex $s 1]}] [gets [lindex $s 0]]]
+        puts [lindex $s 1] pong; flush [lindex $s 1]
+        lappend r [gets [lindex $c 0]] [ns_sockcheck [lindex $c 1]] [ns_sockcheck $l]
+        set c2 [ns_sockopen -timeout 2 -localhost 127.0.0.1 -localport 0 127.0.0.1 $port]
+        set c3 [ns_sockopen -async 127.0.0.1 $port]
+        lappend r [llength $c2] [llength $c3] [catch {ns_socklisten 127.0.0.1 $port}]
+        foreach ch [concat $c $s $c2 $c3 $l] { close $ch }
+        set r
+    ",
+        "2 2 1 ping pong 1 0 2 2 1",
+    );
+    let closed = free_port();
+    err(
+        &srv,
+        &format!("ns_sockopen 127.0.0.1 {closed}"),
+        &format!("can't connect to \"127.0.0.1:{closed}\"; connection refused"),
+    );
+    err(
+        &srv,
+        &format!("ns_sockopen -timeout 2 127.0.0.1 {closed}"),
+        "can't connect to",
+    );
+    err(
+        &srv,
+        "ns_sockopen no.such.host.invalid 80",
+        "reason unknown",
+    );
+    err(&srv, "ns_sockopen", "wrong # args");
+    err(&srv, "ns_sockopen -bogus h 1", "invalid option: \"-bogus\"");
+    err(&srv, "ns_sockopen -async -timeout 1 h 1", "wrong # args");
+    err(&srv, "ns_sockopen -timeout 1 -async h 1", "wrong # args");
+    err(&srv, "ns_sockopen -localhost {} h 1", "invalid hostname");
+    err(&srv, "ns_sockopen -localport -1 h 1", "invalid port: -1");
+    err(&srv, "ns_sockopen -localport", "wrong # args");
+    err(&srv, "ns_sockopen -localhost", "wrong # args");
+    err(&srv, "ns_sockopen {} 1", "invalid hostname");
+    err(&srv, "ns_sockopen h -1", "invalid port: -1; must be > 0");
+    err(&srv, "ns_sockopen h x", "expected integer");
+    err(&srv, "ns_sockopen h 1 2", "wrong # args");
+    err(
+        &srv,
+        "ns_socklisten no.such.host.invalid 1",
+        "could not listen on \"no.such.host.invalid:1\"",
+    );
+    err(&srv, "ns_socklisten 127.0.0.1", "wrong # args");
+    err(&srv, "ns_sockaccept", "wrong # args");
+    err(&srv, "foreach {a b} [ns_socketpair] break; ns_socknonblocking $a; catch {ns_sockaccept $a} m; close $a; close $b; error $m", "accept failed:");
+    err(&srv, "ns_sockcheck", "wrong # args");
+    err(&srv, "ns_sockcheck nosuch", "can not find channel");
+}
+
+#[test]
+fn sock_callbacks() {
+    let out = tempfile::tempdir().unwrap();
+    let exit_file = out.path().join("exit.txt");
+    let exit_path = exit_file.display().to_string();
+    let srv = TestServer::start("", |home| {
+        let lib = home.join("servers/s1/modules/tcl");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            lib.join("sc.tcl"),
+            format!(
+                r#"
+proc sc_cb {{chan why}} {{
+    if {{[gets $chan line] < 0}} {{
+        nsv_lappend sc got eof
+        return 0
+    }}
+    nsv_lappend sc got "$why:$line"
+    expr {{$line ne "stop"}}
+}}
+proc sc_err {{chan why}} {{
+    if {{[gets $chan line] < 0}} {{
+        return 0
+    }}
+    nsv_incr sc errs
+    error boom
+}}
+proc sc_w {{chan why}} {{
+    nsv_set sc w $why
+    return 0
+}}
+proc sc_exit {{chan why}} {{
+    if {{$why eq "x"}} {{
+        set f [open {{{exit_path}}} w]; puts -nonewline $f "exit:$why"; close $f
+    }}
+    return 1
+}}
+proc sl_cb {{r w}} {{
+    puts $w "hi [gets $r]"
+    flush $w
+}}
+"#
+            ),
+        )
+        .unwrap();
+    });
+    // Read callbacks run in a server interp on the callback thread with
+    // the channel and "r"; a false result cancels the callback, so the
+    // last line is never read.  (The writer closes when this interp is
+    // cleaned up.)
+    ok(&srv, "foreach {a b} [ns_socketpair] break; ns_sockcallback $b sc_cb r; puts $a hello; flush $a; after 50; puts $a stop; puts $a ignored; flush $a; string match sock* $a", "1");
+    eventually(&srv, "nsv_get sc got", "r:hello r:stop");
+    eventually(&srv, "set r 0; foreach cb [ns_info sockcallbacks] { if {[lindex $cb 3] eq {sc_cb}} { incr r } }; set r", "0");
+    // A script error is logged and keeps the callback.
+    ok(&srv, "foreach {a b} [ns_socketpair] break; ns_sockcallback $b sc_err r; puts $a one; flush $a; after 50; puts $a two; flush $a", "");
+    eventually(&srv, "nsv_get sc errs", "2");
+    assert!(
+        srv.log().iter().any(|l| l.contains("boom")),
+        "{:?}",
+        srv.log()
+    );
+    // Writable callbacks get "w".
+    ok(
+        &srv,
+        "foreach {a b} [ns_socketpair] break; ns_sockcallback $a sc_w w",
+        "",
+    );
+    eventually(&srv, "nsv_get sc w", "w");
+    // Exit callbacks ("x") run at shutdown; the callback keeps its own
+    // descriptor after this interp closes its channel.
+    ok(
+        &srv,
+        "set l [ns_socklisten 127.0.0.1 0]; ns_sockcallback $l sc_exit rx",
+        "",
+    );
+    eventually(&srv, "set r {}; foreach cb [ns_info sockcallbacks] { if {[lindex $cb 3] eq {sc_exit}} { lappend r [lrange $cb 1 end] } }; set r", "{{read exit} ns:tclsockcallback sc_exit}");
+    // Errors.
+    err(&srv, "ns_sockcallback", "wrong # args");
+    err(&srv, "foreach {a b} [ns_socketpair] break; catch {ns_sockcallback $a sc_cb rq} m; close $a; close $b; error $m", "invalid when specification \"rq\": should be one or more of r, w, e, or x");
+    err(&srv, "foreach {a b} [ns_socketpair] break; catch {ns_sockcallback $a sc_cb {}} m; close $a; close $b; error $m", "invalid when specification \"\"");
+    err(
+        &srv,
+        "ns_sockcallback nosuch sc_cb r",
+        "can not find channel",
+    );
+    // Listen callbacks get a read and a write channel per connection.
+    let port = free_port();
+    ok(
+        &srv,
+        &format!("ns_socklistencallback 127.0.0.1 {port} sl_cb"),
+        "",
+    );
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    std::io::Write::write_all(&mut c, b"there\n").unwrap();
+    let mut reply = String::new();
+    std::io::Read::read_to_string(&mut c, &mut reply).unwrap();
+    assert_eq!(reply, "hi there\n", "{:?}", srv.log());
+    err(
+        &srv,
+        &format!("ns_socklistencallback 127.0.0.1 {port} sl_cb"),
+        "could not register callback",
+    );
+    err(&srv, "ns_socklistencallback * x sl_cb", "expected integer");
+    err(&srv, "ns_socklistencallback 127.0.0.1 1", "wrong # args");
+    drop(srv);
+    assert_eq!(std::fs::read_to_string(&exit_file).unwrap(), "exit:x");
+}
+
+#[test]
+fn quewait_in_prequeue_filters() {
+    let srv = TestServer::start("", |home| {
+        let lib = home.join("servers/s1/modules/tcl");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            lib.join("qw.tcl"),
+            r#"
+ns_register_filter prequeue GET /qw/* qw_filter
+proc qw_filter {why} {
+    foreach {a b} [ns_socketpair] break
+    switch -glob [ns_conn url] {
+        */read { puts $a ready; flush $a; ns_quewait $b readable 5 [list qw_cb $b] }
+        */write { ns_quewait $a writable 5 [list qw_cb $a] }
+        */timeout { ns_quewait $b readable 0:100000 [list qw_cb $b] }
+        */drop { ns_quewait $b readable 10 [list qw_cb $b] }
+        */chain { ns_quewait $a writable 5 [list qw_chain $a $b] }
+        */error { ns_quewait $a writable 5 qw_fail }
+    }
+    return filter_ok
+}
+proc qw_cb {chan why} { nsv_set qw [ns_conn url] $why }
+proc qw_fail {why} { error qwboom }
+proc qw_chain {a b why} {
+    nsv_set qw chain1 $why
+    puts $a x; flush $a
+    ns_quewait $b readable 5 [list qw_cb $b]
+}
+ns_register_proc GET /qw/* qw_proc
+proc qw_proc {} {
+    set url [ns_conn url]
+    set v [expr {[nsv_exists qw $url] ? [nsv_get qw $url] : "none"}]
+    ns_return 200 text/plain $v
+}
+ns_register_proc GET /late late_proc
+proc late_proc {} {
+    foreach {a b} [ns_socketpair] break
+    set r [catch {ns_quewait $a writable 1 x} m]
+    lappend r $m [catch {ns_quewait $a bogus 1 x} m] $m
+    ns_return 200 text/plain $r
+}
+"#,
+        )
+        .unwrap();
+    });
+    assert_eq!(srv.get("/qw/read").body, "readable", "{:?}", srv.log());
+    assert_eq!(srv.get("/qw/write").body, "writable");
+    assert_eq!(srv.get("/qw/timeout").body, "timeout");
+    assert_eq!(srv.get("/qw/chain").body, "readable");
+    ok(&srv, "nsv_get qw chain1", "writable");
+    assert_eq!(srv.get("/qw/error").body, "none");
+    assert!(
+        srv.log().iter().any(|l| l.contains("qwboom")),
+        "{:?}",
+        srv.log()
+    );
+    assert_eq!(
+        srv.get("/late").body,
+        "1 {could not register sock wait} 1 {bad event \"bogus\": must be readable, or writable}"
+    );
+    assert!(srv
+        .log()
+        .iter()
+        .any(|l| l.contains("attempt to register quewait outside driver thread")));
+    // A client that goes away while the request waits is dropped: the
+    // callbacks see "dropped" and no response is sent.
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", srv.port)).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    std::io::Write::write_all(&mut c, b"GET /qw/drop HTTP/1.0\r\n\r\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    c.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut out = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut c, &mut out);
+    assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    eventually(&srv, "nsv_get qw /qw/drop", "dropped");
+    err(&srv, "ns_quewait x readable 1 y", "no connection");
+    err(&srv, "ns_quewait x readable 1", "wrong # args");
 }

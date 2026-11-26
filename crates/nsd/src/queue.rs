@@ -138,6 +138,7 @@ fn run_incoming(
         cls: Vec::new(),
         limits: Some(Arc::clone(limits)),
         pool: pool.to_owned(),
+        que_waits: crate::quewait::QueWaits::default(),
     };
     let ctx = ConnCtx::new(Arc::clone(server), conn);
     if too_large {
@@ -160,7 +161,15 @@ pub fn conn_run(conn: &ConnRef) -> Status {
     if is_proxy {
         return op::run_proxy_request(conn);
     }
+    crate::quewait::set_open(conn, true);
     let mut status = op::run_filters(conn, FilterWhen::PreQueue);
+    if status == Status::Ok && !crate::quewait::run(conn) {
+        // The client dropped while waiting: close without a response.
+        crate::quewait::set_open(conn, false);
+        drop_conn(conn);
+        return Status::Error;
+    }
+    crate::quewait::set_open(conn, false);
     if status == Status::Ok {
         status = op::run_filters(conn, FilterWhen::Read);
     }
@@ -190,6 +199,18 @@ pub fn conn_run(conn: &ConnRef) -> Status {
         status = Status::FilterReturn;
     }
     status
+}
+
+/// Close a connection whose client went away (`SockClose`): no response.
+fn drop_conn(conn: &ConnRef) {
+    let sock = {
+        let mut c = conn.conn_mut();
+        c.flags.closed = true;
+        c.sock.take()
+    };
+    if let Some(s) = sock {
+        s.release(false);
+    }
 }
 
 fn finish(conn: &ConnRef, status: Status) {

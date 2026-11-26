@@ -198,6 +198,9 @@ pub struct Sock {
     pub stream: Box<dyn ConnStream>,
     /// Pipelined bytes after the current request.
     pub leftover: Vec<u8>,
+    /// The client's TCP descriptor (for polling while the stream is
+    /// owned by the connection, as `ns_quewait` does).
+    pub fd: Option<std::os::fd::RawFd>,
     reply: Option<oneshot::Sender<SockReturn>>,
 }
 
@@ -580,6 +583,7 @@ impl Driver {
 
     async fn handle(self: Arc<Self>, tcp: TcpStream, peer: SocketAddr) {
         let accept_time = SystemTime::now();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&tcp);
         let Ok(Ok(mut stream)) =
             tokio::time::timeout(self.info.recvwait, self.wrapper.wrap(tcp)).await
         else {
@@ -623,6 +627,7 @@ impl Driver {
                 sock: Sock {
                     stream,
                     leftover: std::mem::take(&mut buf),
+                    fd: Some(fd),
                     reply: Some(tx),
                 },
                 request: req.request,

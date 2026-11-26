@@ -29,6 +29,7 @@ Phase 1 (this release) ports the server core and the most-used modules:
 | Fastpath (static files, index files, conditional GET, caching) | ✅ |
 | ADP (`<% %>`, `<%= %>`, `<script runat=server>`, registered tags, includes, streaming) | ✅ |
 | Tcl interp lifecycle (`init.tcl`, `ns_ictl`, `ns_eval`, traces) | ✅ |
+| Socket commands (`ns_sockopen`, `ns_socklisten`, `ns_sockaccept`, `ns_socketpair`, `ns_sockselect`, `ns_sockcallback`, `ns_socklistencallback`, `ns_quewait`) on real Tcl channels, with the `-socks-` callback thread | ✅ |
 | ~170 `ns_*` commands (`ns_conn`, `ns_return*`, `ns_set`, `nsv_*`, `ns_cache`, `ns_job`, `ns_thread`, `ns_sched*`, `ns_http`, ...) | ✅ |
 | `nslog` (access log), `nsperm` (Basic auth & permissions), `nscgi` (CGI/1.1) | ✅ |
 | `nsssl` (TLS via rustls), `nszlib`, `nscp` (control port), `nsdb` (SQLite driver), `nsproxy` (worker processes) | ✅ (phase 2) |
