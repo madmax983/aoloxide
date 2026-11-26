@@ -20,6 +20,7 @@
 //! * Panics inside commands are caught and turned into Tcl errors; they never
 //!   unwind across the C boundary.
 
+mod extra;
 mod ffi;
 
 use std::cell::{Cell, RefCell};
@@ -31,8 +32,10 @@ use std::ptr;
 use std::sync::Once;
 
 use ns_script::{
-    close_fd, Code, Command, Exception, Extensions, Interp, ScriptEngine, ScriptResult,
+    close_fd, Canceller, Code, Command, DetachedChannel, Exception, Extensions, Interp,
+    ScriptEngine, ScriptResult, TraceOps, VarTrace,
 };
+use std::sync::Arc;
 
 static INIT: Once = Once::new();
 const FILE: &[u8] = b"ns-tcl\0";
@@ -195,8 +198,13 @@ impl ScriptEngine for TclEngine {
 
     fn finalize_thread(&self) {
         HELD.with(|h| h.borrow_mut().clear());
+        extra::release_thread_canceller();
         // SAFETY: called by a thread that is done with all its interps.
         unsafe { ffi::Tcl_FinalizeThread() };
+    }
+
+    fn thread_canceller(&self) -> Option<Arc<dyn Canceller>> {
+        extra::thread_canceller()
     }
 
     fn hold_socket(&self, fd: i32) -> Result<String, Exception> {
@@ -533,6 +541,100 @@ impl Interp for TclInterp {
 
     fn marked_for_delete(&self) -> bool {
         self.delete.get()
+    }
+
+    fn handle(&self) -> usize {
+        self.raw as usize
+    }
+
+    fn invoke_async(&self) {
+        self.invoke_async_impl();
+    }
+
+    fn get_var2(&self, part1: &str, part2: Option<&str>) -> Option<String> {
+        let a = cstring(part1);
+        let k = part2.map(cstring);
+        // SAFETY: raw live; a/k valid for the call.
+        let obj = unsafe {
+            ffi::Tcl_GetVar2Ex(
+                self.raw,
+                a.as_ptr(),
+                k.as_ref().map_or(ptr::null(), |k| k.as_ptr()),
+                0,
+            )
+        };
+        // SAFETY: obj, when non-null, is live.
+        (!obj.is_null()).then(|| unsafe { obj_string(obj) })
+    }
+
+    fn set_var2(&self, part1: &str, part2: Option<&str>, value: &str) -> Result<(), Exception> {
+        let a = cstring(part1);
+        let k = part2.map(cstring);
+        // SAFETY: raw live; a/k valid; Tcl references the value object.
+        let r = unsafe {
+            ffi::Tcl_SetVar2Ex(
+                self.raw,
+                a.as_ptr(),
+                k.as_ref().map_or(ptr::null(), |k| k.as_ptr()),
+                new_obj(value),
+                ffi::TCL_LEAVE_ERR_MSG,
+            )
+        };
+        if r.is_null() {
+            Err(Exception::error(self.result()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn trace_var(
+        &self,
+        name: &str,
+        ops: TraceOps,
+        key: usize,
+        cb: VarTrace,
+    ) -> Result<(), Exception> {
+        self.trace_var_impl(name, ops, key, cb)
+    }
+
+    fn var_trace_keys(&self, name: &str) -> Vec<usize> {
+        self.var_trace_keys_impl(name)
+    }
+
+    fn channel_id(&self, name: &str) -> Result<usize, Exception> {
+        self.channel_id_impl(name)
+    }
+
+    fn channel_is_shared(&self, name: &str) -> Result<bool, Exception> {
+        self.channel_is_shared_impl(name)
+    }
+
+    fn channel_check_mode(&self, name: &str, write: bool) -> Result<(), Exception> {
+        self.channel_check_mode_impl(name, write)
+    }
+
+    fn channel_detach(&self, name: &str) -> Result<DetachedChannel, Exception> {
+        self.channel_detach_impl(name)
+    }
+
+    fn channel_attach(&self, chan: DetachedChannel) -> Result<String, Exception> {
+        self.channel_attach_impl(chan)
+    }
+
+    fn channel_unregister(&self, name: &str, id: usize) {
+        self.channel_unregister_impl(name, id);
+    }
+
+    fn channel_close_detached(&self, chan: DetachedChannel) {
+        Self::channel_close_detached_impl(chan);
+    }
+
+    fn channel_write(&self, name: &str, data: &[u8]) -> Result<(), Exception> {
+        self.channel_write_impl(name, data)
+    }
+
+    fn channel_from_tcp(&self, stream: std::net::TcpStream) -> Result<String, Exception> {
+        self.channel_from_tcp_impl(stream)
     }
 
     fn channel_fd(&self, chan: &str, write: bool) -> Result<i32, Exception> {

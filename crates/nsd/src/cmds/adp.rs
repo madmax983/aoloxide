@@ -162,6 +162,23 @@ fn ns_adp_ctl(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     ];
     let (_, opt) = super::subcommand(argv, opts)?;
     let st = ns_interp(interp)?;
+    if opt == "channel" {
+        if argv.len() != 3 {
+            return Err(wrong_args(argv, 2, "channel"));
+        }
+        let id = &argv[2];
+        if id.is_empty() {
+            // Final flush to the old channel, which resets the ADP state
+            // (NsAdpFlush with stream 0 runs NsAdpReset).
+            if st.borrow().adp.chan.is_some() {
+                adp::flush_output(interp, false)?;
+            }
+        } else {
+            interp.channel_check_mode(id, true)?;
+            st.borrow_mut().adp.chan = Some(id.clone());
+        }
+        return Ok(String::new());
+    }
     let mut s = st.borrow_mut();
     let a = &mut s.adp;
     if opt == "bufsize" {
@@ -170,11 +187,6 @@ fn ns_adp_ctl(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
             a.bufsize = int_arg(v)?.max(0) as usize;
         }
         return Ok(old.to_string());
-    }
-    if opt == "channel" {
-        return Err(Exception::error(
-            "ns_adp_ctl channel: output channels are not supported",
-        ));
     }
     let slot: Option<&mut bool> = match opt {
         "autoabort" => Some(&mut a.autoabort),
@@ -198,10 +210,20 @@ fn ns_adp_ctl(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     }
 }
 
-fn ns_adp_debug(_interp: &dyn Interp, _argv: &[String]) -> ScriptResult {
-    Err(Exception::error(
-        "ns_adp_debug: the TclPro debugger is not supported",
-    ))
+/// `ns_adp_debug ?procs? ?host? ?port?`: connect to the TclPro debugger
+/// through the server's `debuginit` proc (`NsTclAdpDebugCmd`).
+fn ns_adp_debug(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
+    if argv.len() > 4 {
+        return Err(Exception::error(format!(
+            "wrong # args: should be \"{} ?procs? ?host? ?port?\"",
+            argv[0]
+        )));
+    }
+    let arg = |i: usize| argv.get(i).map(String::as_str);
+    if adp::debug_init(interp, arg(2), arg(3), arg(1)).is_err() {
+        return Err(Exception::error("could not initialize debugger"));
+    }
+    Ok(ns_interp(interp)?.borrow().adp.debug_level.to_string())
 }
 
 fn ns_adp_dir(interp: &dyn Interp, argv: &[String]) -> ScriptResult {

@@ -296,6 +296,11 @@ pub struct Server {
     pub nsv: Nsv,
     /// `ns_var` variables.
     pub vars: Mutex<HashMap<String, String>>,
+    /// Channels shared with `ns_chan create`/`put`, by name
+    /// (`servPtr->chans`).
+    pub chans: Mutex<BTreeMap<String, ns_script::DetachedChannel>>,
+    /// `ns_share` variables (`servPtr->share`).
+    pub share: crate::cmds::share::ShareState,
     location_proc: RwLock<Option<LocationProc>>,
 }
 
@@ -462,6 +467,8 @@ impl Server {
             next_set: AtomicU64::new(0),
             nsv: Nsv::new(nsvbuckets),
             vars: Mutex::new(HashMap::new()),
+            chans: Mutex::new(BTreeMap::new()),
+            share: crate::cmds::share::ShareState::default(),
             location_proc: RwLock::new(None),
         });
         global.add_server(&server);

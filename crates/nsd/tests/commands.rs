@@ -561,7 +561,11 @@ fn http_client_and_sockets() {
     err(&srv, "ns_geturl https://example.invalid/", "only http://");
     ok(&srv, &format!("set fds [ns_sockopen 127.0.0.1 {}]; set f [lindex $fds 1]; fconfigure $f -translation binary; puts -nonewline $f \"GET /c.txt HTTP/1.0\\r\\n\\r\\n\"; flush $f; set r [read [lindex $fds 0]]; close $f; string match *client* $r", srv.port), "1");
     ok(&srv, "ns_chan list", "");
-    err(&srv, "ns_chan create x y", "not supported");
+    err(
+        &srv,
+        "ns_chan create x y",
+        "can not find channel named \"x\"",
+    );
     ok(&srv, "ns_checkurl GET /c.txt", "1");
 }
 
@@ -795,11 +799,8 @@ fn adp_commands() {
 }
 
 #[test]
-fn unsupported_commands_fail_clearly() {
+fn commands_without_a_connection_fail_clearly() {
     let srv = TestServer::start("", |_| {});
-    for c in ["ns_share x", "ns_ictl cancel 1"] {
-        err(&srv, c, "not supported");
-    }
     err(&srv, "ns_conn url", "no connection");
     ok(&srv, "ns_conn isconnected", "0");
 }

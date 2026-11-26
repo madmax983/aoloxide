@@ -67,13 +67,19 @@ classDiagram
 * Commands that need engine-specific objects (Tcl channels for
   `ns_sockopen`, `ns_returnfp`, `ns_conn copy`) go through the engine's own
   commands via `eval_words` (`read`, `puts`, `fconfigure`, `socket`).
-  Socket commands use a few channel methods on the traits: the descriptor
-  behind a channel (`Interp::channel_fd`), buffered input
-  (`channel_buffered`), wrapping a socket in a new channel
-  (`socket_channel`), and channels held by a thread rather than an interp
-  (`ScriptEngine::hold_socket`, `Interp::attach_held_channel`,
-  `ScriptEngine::release_held`) for socket callbacks, whose channel lives
-  on the callback thread across the interps that use it.  Other features
-  that need the C channel API directly (`ns_chan` transfer between interps,
-  `ns_conn channel`) are not available through the trait yet.
+  Features that need the C API directly have trait methods with
+  engine-neutral types, whose default implementations report that the
+  engine does not support them:
+  * sockets: the descriptor behind a channel (`Interp::channel_fd`),
+    buffered input (`channel_buffered`), wrapping a socket in a new
+    channel (`socket_channel`), and channels held by a thread rather than
+    an interp (`ScriptEngine::hold_socket`, `Interp::attach_held_channel`,
+    `ScriptEngine::release_held`) for socket callbacks, whose channel lives
+    on the callback thread across the interps that use it;
+  * channel transfer between threads (`channel_detach`/`channel_attach`
+    with a `Send` `DetachedChannel`, for `ns_chan`), socket channels for
+    `ns_conn channel` (`channel_from_tcp`) and raw channel writes
+    (`ns_adp_ctl channel`);
+  * variable traces (`ns_share`) and a per-thread `Canceller`
+    (`ns_ictl cancel`).
 * Building requires Tcl 8.6 development files.

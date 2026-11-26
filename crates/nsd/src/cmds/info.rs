@@ -458,10 +458,31 @@ fn ns_ictl(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
                 .collect();
             Ok(interp.list_from(&v))
         }
-        "threads" => Ok(String::new()),
-        "cancel" => Err(Exception::error(
-            "ns_ictl cancel: interp cancellation is not supported",
-        )),
+        "threads" => {
+            check_args(argv, 2, 2, 2, "")?;
+            let tids: Vec<String> = crate::interp::active_threads()
+                .iter()
+                .map(u64::to_string)
+                .collect();
+            Ok(interp.list_from(&tids))
+        }
+        "cancel" => {
+            check_args(argv, 3, 3, 2, "tid")?;
+            // Thread ids are integers; `ns_thread id`'s ThreadId(N) form is
+            // accepted too.
+            let arg = &argv[2];
+            let tid = ns_script::parse_int(arg).or_else(|e| {
+                arg.strip_prefix("ThreadId(")
+                    .and_then(|r| r.strip_suffix(')'))
+                    .and_then(|n| n.parse::<i64>().ok())
+                    .ok_or(e)
+            })?;
+            if u64::try_from(tid).is_ok_and(crate::interp::cancel_thread) {
+                Ok(String::new())
+            } else {
+                Err(Exception::error(format!("no such active thread: {arg}")))
+            }
+        }
         "package" => {
             if argv.len() < 3 {
                 return Err(wrong_args(argv, 2, "option ?args?"));
