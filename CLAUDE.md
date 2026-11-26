@@ -14,6 +14,7 @@ Guidance for working on aoloxide, a Rust port of AOLserver 4.5.
 | `crates/nspd` | proxy-daemon library + `nssqlitepd` | `nspd/` |
 | `crates/aoloxide` | the `nsd` binary + module registry | `nsd/main.c`, `nsmain.c` |
 | `verus/` | Verus specs & proofs (run in CI) | |
+| `bench/` | wrk benchmark vs an equivalent axum server (`bench/run.sh`; standalone crate, not in the workspace) | |
 | `docs/adr/` | architecture decisions | |
 | `docs/porting.md` | C → Rust map, deviations, phase plan | |
 

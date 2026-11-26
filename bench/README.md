@@ -22,7 +22,10 @@ DURATION=3 WARMUP=1 CONNS=64 bench/run.sh    # quick look
 
 * **aoloxide** runs `nsd` with [`aoloxide/nsconfig.tcl`](aoloxide/nsconfig.tcl): only
   `nssock` is loaded (no access log, auth or CGI), `minthreads = maxthreads = $THREADS`
-  (default 20), `maxsock 1024`.
+  (default 20), `maxsock 1024`, and `ns_limits set default -maxwait 1024`.
+  AOLserver's default `maxwait` of 100 answers excess queued requests with
+  503 (cheap responses that inflate req/s at 256 connections); axum queues
+  without bound, so the cap is lifted.
 * **axum** is [`axum-server/`](axum-server), a standalone crate (its own
   `[workspace]`, so axum is not a dependency of the aoloxide workspace).  It
   sets `TCP_NODELAY` on accepted sockets, as aoloxide's driver does; without it
