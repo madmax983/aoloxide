@@ -888,7 +888,7 @@ fn socket_channels() {
     err(
         &srv,
         &format!("ns_sockopen -timeout 2 127.0.0.1 {closed}"),
-        "can't connect to",
+        &format!("can't connect to \"127.0.0.1:{closed}\"; operation now in progress"),
     );
     err(
         &srv,
@@ -950,6 +950,10 @@ proc sc_w {{chan why}} {{
     nsv_set sc w $why
     return 0
 }}
+proc sc_w2 {{chan why}} {{
+    nsv_set sc w2 $why
+    return 0
+}}
 proc sc_exit {{chan why}} {{
     if {{$why eq "x"}} {{
         set f [open {{{exit_path}}} w]; puts -nonewline $f "exit:$why"; close $f
@@ -969,11 +973,13 @@ proc sl_cb {{r w}} {{
     // the channel and "r"; a false result cancels the callback, so the
     // last line is never read.  (The writer closes when this interp is
     // cleaned up.)
-    ok(&srv, "foreach {a b} [ns_socketpair] break; ns_sockcallback $b sc_cb r; puts $a hello; flush $a; after 50; puts $a stop; puts $a ignored; flush $a; string match sock* $a", "1");
+    // Each line is written once the previous one has been seen: lines
+    // that reach the channel buffer together are not polled for again.
+    ok(&srv, "foreach {a b} [ns_socketpair] break; ns_sockcallback $b sc_cb r; puts $a hello; flush $a; for {set i 0} {$i < 1000 && ![nsv_exists sc got]} {incr i} { after 10 }; puts $a stop; puts $a ignored; flush $a; string match sock* $a", "1");
     eventually(&srv, "nsv_get sc got", "r:hello r:stop");
     eventually(&srv, "set r 0; foreach cb [ns_info sockcallbacks] { if {[lindex $cb 3] eq {sc_cb}} { incr r } }; set r", "0");
     // A script error is logged and keeps the callback.
-    ok(&srv, "foreach {a b} [ns_socketpair] break; ns_sockcallback $b sc_err r; puts $a one; flush $a; after 50; puts $a two; flush $a", "");
+    ok(&srv, "foreach {a b} [ns_socketpair] break; ns_sockcallback $b sc_err r; puts $a one; flush $a; for {set i 0} {$i < 1000 && ![nsv_exists sc errs]} {incr i} { after 10 }; puts $a two; flush $a", "");
     eventually(&srv, "nsv_get sc errs", "2");
     assert!(
         srv.log().iter().any(|l| l.contains("boom")),
@@ -995,6 +1001,18 @@ proc sl_cb {{r w}} {{
         "",
     );
     eventually(&srv, "set r {}; foreach cb [ns_info sockcallbacks] { if {[lindex $cb 3] eq {sc_exit}} { lappend r [lrange $cb 1 end] } }; set r", "{{read exit} ns:tclsockcallback sc_exit}");
+    // An exit-only registration is dropped by the callback thread without
+    // being called, and, as in AOLserver, its descriptor is leaked: the
+    // listening socket stays open after the channel is closed.
+    let leaked = eval(&srv, "set l [ns_socklisten 127.0.0.1 0]; set port [lindex [fconfigure $l -sockname] 2]; ns_sockcallback $l sc_exit x; close $l; foreach {a b} [ns_socketpair] break; ns_sockcallback $a sc_w2 w; set port").unwrap();
+    eventually(&srv, "nsv_get sc w2", "w");
+    ok(
+        &srv,
+        &format!(
+            "set c [ns_sockopen 127.0.0.1 {leaked}]; foreach ch $c {{ close $ch }}; llength $c"
+        ),
+        "2",
+    );
     // Errors.
     err(&srv, "ns_sockcallback", "wrong # args");
     err(&srv, "foreach {a b} [ns_socketpair] break; catch {ns_sockcallback $a sc_cb rq} m; close $a; close $b; error $m", "invalid when specification \"rq\": should be one or more of r, w, e, or x");
@@ -1087,7 +1105,7 @@ proc late_proc {} {
     );
     assert_eq!(
         srv.get("/late").body,
-        "1 {could not register sock wait} 1 {bad event \"bogus\": must be readable, or writable}"
+        "1 {could not register sock wait} 1 {bad event \"bogus\": must be readable or writable}"
     );
     assert!(srv
         .log()

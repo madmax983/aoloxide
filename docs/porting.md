@@ -190,6 +190,15 @@ Modules:
     change it), so a new registration appears once the thread has woken.
     The callback thread waits for startup to complete, or for shutdown to
     begin (AOLserver waited for startup only).
+32 (sockets). Failures inside the socket callback system that AOLserver
+    treats as fatal (`Ns_Fatal`, which stops the server) are logged
+    instead: a failed `poll()` in the `-socks-` thread is retried after
+    100 ms, and a failed trigger `send()` or `recv()` is logged and the
+    thread carries on.  When the trigger socket pair or the thread cannot
+    be created, the registration fails ("could not register callback"),
+    and registrations other threads queued in the meantime, already
+    accepted, are dropped, closing their descriptors (modelled as
+    `abandon` in `verus/sockcallback.rs`).
 
 ## Not yet supported (phase 2)
 
@@ -218,7 +227,7 @@ for `ns_chan`.
 | `pool.rs` | pool transitions keep `idle ≤ current ≤ max`; enqueue never strands work while there is capacity |
 | `cache.rs` | inserts keep total size ≤ max; eviction removes only LRU entries |
 | `proxy.rs` | nsproxy handle accounting (`avail + out = max`, idle workers ≤ spare capacity under any interleaving of get, release and config, including a config between a failed `get`'s pops and its give-back; a failed `get` restores the pool) and the `Idle → Busy → Done → Idle` proxy state machine |
-| `sockcallback.rs` | socket callback registry accounting (`queued + active + done + released = accepted`, nothing held once stopped), registrations refused once shutdown is pending so `stop` releases every callback, and the `Queued → Active → Done → Released` callback life cycle: never called after returning false or being released |
+| `sockcallback.rs` | socket callback registry accounting (`queued + active + done + released = accepted`, nothing held once stopped), registrations refused once shutdown is pending so `stop` releases every callback, removal of entries awaiting the sweep, dropping the queue when the thread cannot start, and the `Queued → Active → Done → Released` callback life cycle: never called after returning false or being released |
 
 The production implementations are additionally checked against the same
 specifications by property tests (`proptest`).

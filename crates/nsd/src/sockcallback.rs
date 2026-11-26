@@ -129,10 +129,25 @@ impl Table {
         }
     }
 
-    /// Drop entries with no I/O condition left (finished callbacks, and
-    /// registrations for [`SOCK_EXIT`] alone, as in AOLserver).
+    /// Drop entries with no I/O condition left: finished callbacks
+    /// (`when == 0`), and registrations for [`SOCK_EXIT`] alone, which
+    /// AOLserver frees without calling, leaking their argument.  Their
+    /// procs are leaked here too, so whatever they own (a Tcl callback's
+    /// descriptor) stays open.
     fn sweep(&mut self) {
-        self.entries.retain(|_, e| e.when & SOCK_ANY != 0);
+        let gone: Vec<RawFd> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.when & SOCK_ANY == 0)
+            .map(|(&fd, _)| fd)
+            .collect();
+        for fd in gone {
+            if let Some(e) = self.entries.remove(&fd) {
+                if e.when != 0 {
+                    std::mem::forget(e.proc_);
+                }
+            }
+        }
     }
 
     fn pollfds(&self) -> Vec<libc::pollfd> {
@@ -694,8 +709,10 @@ mod tests {
         assert_eq!(cbs.callbacks(), Vec::new());
         cbs.start_shutdown();
         assert!(cbs.wait_shutdown(Duration::from_secs(10)));
-        // The exit-only callback was swept unrun; the panicking one ran once.
+        // The exit-only callback was swept unrun and leaked, as AOLserver
+        // leaks its argument; the panicking one ran once and was dropped.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&calls), 2);
         sock::close(a);
         sock::close(b);
         // Shutdown with nothing running is a no-op.
@@ -793,5 +810,190 @@ mod tests {
         assert_eq!(p[0].events, libc::POLLOUT | libc::POLLPRI);
         t.exit_all();
         assert!(t.entries.is_empty());
+    }
+
+    /// What the model callbacks of [`table_matches_model`] record.
+    #[derive(Default)]
+    struct Log {
+        calls: Vec<(usize, u32)>,
+        dropped: Vec<usize>,
+        misuse: bool,
+    }
+
+    fn lock(log: &Mutex<Log>) -> MutexGuard<'_, Log> {
+        log.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records the drop of callback `id`.
+    struct Guard(usize, Arc<Mutex<Log>>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            lock(&self.1).dropped.push(self.0);
+        }
+    }
+
+    /// A callback that logs its calls and returns `keep` from I/O
+    /// conditions; a call after returning false is misuse.
+    fn model_proc(id: usize, keep: bool, log: &Arc<Mutex<Log>>) -> SockProc {
+        let g = Guard(id, Arc::clone(log));
+        let mut finished = false;
+        Box::new(move |_, why| {
+            let mut l = lock(&g.1);
+            l.misuse |= finished;
+            l.calls.push((g.0, why));
+            if why & (SOCK_ANY | SOCK_DROP) != 0 {
+                finished = !keep;
+            }
+            keep
+        })
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Reg(RawFd, u32, bool),
+        Cancel(RawFd, bool),
+        Apply,
+        Sweep,
+        Fire(Vec<u8>),
+        Exit,
+    }
+
+    fn op() -> impl proptest::strategy::Strategy<Value = Op> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (0..4, 1u32..16, any::<bool>()).prop_map(|(fd, w, k)| Op::Reg(fd, w, k)),
+            (0..4, any::<bool>()).prop_map(|(fd, p)| Op::Cancel(fd, p)),
+            Just(Op::Apply),
+            Just(Op::Sweep),
+            proptest::collection::vec(0u8..8, 4).prop_map(Op::Fire),
+            Just(Op::Exit),
+        ]
+    }
+
+    fn revents(mask: u8) -> libc::c_short {
+        [libc::POLLIN, libc::POLLOUT, libc::POLLPRI]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .fold(0, |r, (_, e)| r | e)
+    }
+
+    /// One registration or cancel in the reference model.
+    struct ModelQ {
+        fd: RawFd,
+        when: u32,
+        id: Option<usize>,
+        keep: bool,
+    }
+
+    proptest::proptest! {
+        /// The callback table against a reference model of
+        /// `SockCallbackThread` (the accounting of `verus/sockcallback.rs`):
+        /// cancels and replacements drop the old callback, the sweep drops
+        /// finished callbacks and leaks exit-only ones, callbacks run only
+        /// for registered conditions and never after returning false, and
+        /// every accepted callback ends up dropped or leaked.
+        #[test]
+        fn table_matches_model(ops in proptest::collection::vec(op(), 0..40)) {
+            let log = Arc::new(Mutex::new(Log::default()));
+            let mut t = Table::default();
+            let mut queue = Vec::new();
+            let mut m_queue: Vec<ModelQ> = Vec::new();
+            let mut m_table: BTreeMap<RawFd, (usize, u32, bool)> = BTreeMap::new();
+            let mut calls = Vec::new();
+            let mut dropped = Vec::new();
+            let mut leaked = Vec::new();
+            let mut next = 0;
+            for op in ops {
+                match op {
+                    Op::Reg(fd, when, keep) => {
+                        queue.push(Queued { fd, when, proc_: Some(model_proc(next, keep, &log)), info: vec![] });
+                        m_queue.push(ModelQ { fd, when, id: Some(next), keep });
+                        next += 1;
+                    }
+                    Op::Cancel(fd, with_proc) => {
+                        let id = with_proc.then_some(next);
+                        queue.push(Queued { fd, when: SOCK_CANCEL, proc_: id.map(|i| model_proc(i, true, &log)), info: vec![] });
+                        m_queue.push(ModelQ { fd, when: SOCK_CANCEL, id, keep: true });
+                        next += usize::from(with_proc);
+                    }
+                    Op::Apply => {
+                        t.apply(std::mem::take(&mut queue));
+                        for q in std::mem::take(&mut m_queue) {
+                            if q.when & SOCK_CANCEL != 0 {
+                                if let Some((old, _, _)) = m_table.remove(&q.fd) {
+                                    dropped.push(old);
+                                }
+                                if let Some(id) = q.id {
+                                    calls.push((id, SOCK_CANCEL));
+                                    dropped.push(id);
+                                }
+                            } else if let Some(id) = q.id {
+                                if let Some((old, _, _)) = m_table.insert(q.fd, (id, q.when, q.keep)) {
+                                    dropped.push(old);
+                                }
+                            }
+                        }
+                    }
+                    Op::Sweep => {
+                        t.sweep();
+                        m_table.retain(|_, &mut (id, when, _)| {
+                            if when & SOCK_ANY != 0 {
+                                return true;
+                            }
+                            if when == 0 { dropped.push(id) } else { leaked.push(id) }
+                            false
+                        });
+                    }
+                    Op::Fire(masks) => {
+                        let mut p = t.pollfds();
+                        for (i, pfd) in p.iter_mut().enumerate() {
+                            pfd.revents = revents(masks[i % masks.len()]);
+                        }
+                        t.fire(&p);
+                        for (i, e) in m_table.values_mut().enumerate() {
+                            let r = revents(masks[i % masks.len()]);
+                            for (ev, w) in CONDITIONS {
+                                if e.1 & w != 0 && r & ev != 0 {
+                                    calls.push((e.0, w));
+                                    if !e.2 {
+                                        e.1 = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Op::Exit => {
+                        t.exit_all();
+                        for (id, when, _) in std::mem::take(&mut m_table).into_values() {
+                            if when & SOCK_EXIT != 0 {
+                                calls.push((id, SOCK_EXIT));
+                            }
+                            dropped.push(id);
+                        }
+                    }
+                }
+                let got: Vec<(RawFd, u32)> = t.entries.iter().map(|(&fd, e)| (fd, e.when)).collect();
+                let want: Vec<(RawFd, u32)> = m_table.iter().map(|(&fd, e)| (fd, e.1)).collect();
+                proptest::prop_assert_eq!(got, want);
+                let l = lock(&log);
+                proptest::prop_assert!(!l.misuse);
+                proptest::prop_assert_eq!(&l.calls, &calls);
+                let mut a = l.dropped.clone();
+                let mut b = dropped.clone();
+                a.sort_unstable();
+                b.sort_unstable();
+                proptest::prop_assert_eq!(a, b);
+            }
+            drop(t);
+            drop(queue);
+            // Accounting: every accepted callback was dropped or leaked,
+            // never both.
+            let mut all = lock(&log).dropped.clone();
+            all.extend(&leaked);
+            all.sort_unstable();
+            proptest::prop_assert_eq!(all, (0..next).collect::<Vec<_>>());
+        }
     }
 }

@@ -9,9 +9,17 @@
 //! `when = 0` and is swept on the next pass.  At stop it runs every exit
 //! callback and empties the table.
 //!
+//! A cancel or a new registration for the same descriptor can remove an
+//! entry that is still awaiting the sweep (the thread applies the queue
+//! before it sweeps).  If the thread cannot be started, the registrations
+//! queued so far are dropped and the registry is stopped again.
+//!
 //! Counts: `queued` (on the queue), `active` (in the table with an I/O
-//! condition), `done` (in the table with `when == 0`, awaiting the sweep)
-//! and `released` (cancelled, replaced, swept or exited).  We prove every
+//! condition), `done` (in the table with no I/O condition: `when == 0`
+//! after returning false, or an exit-only registration; awaiting the
+//! sweep) and `released` (cancelled, replaced, swept, exited or dropped
+//! when the thread failed to start; a swept exit-only registration is
+//! leaked, as in AOLserver, but has left the registry).  We prove every
 //! transition preserves
 //!
 //! * `queued + active + done + released == accepted` (no registration is
@@ -107,6 +115,35 @@ pub open spec fn remove(r: Reg) -> Reg {
     }
 }
 
+/// A cancel, or a new registration for its descriptor, removes an entry
+/// that is awaiting the sweep.
+pub open spec fn remove_done(r: Reg) -> Reg {
+    Reg {
+        accepted: r.accepted,
+        queued: r.queued,
+        active: r.active,
+        done: r.done - 1,
+        released: r.released + 1,
+        pending: r.pending,
+        running: r.running,
+    }
+}
+
+/// The thread could not be started: the registrations queued since the
+/// registry was started (the table is still empty) are dropped and the
+/// registry is stopped.
+pub open spec fn abandon(r: Reg) -> Reg {
+    Reg {
+        accepted: r.accepted,
+        queued: 0,
+        active: r.active,
+        done: r.done,
+        released: r.released + r.queued,
+        pending: r.pending,
+        running: false,
+    }
+}
+
 /// The sweep after each take.
 pub open spec fn sweep(r: Reg) -> Reg {
     Reg {
@@ -190,6 +227,27 @@ pub proof fn remove_preserves(r: Reg)
 {
 }
 
+pub proof fn remove_done_preserves(r: Reg)
+    requires
+        inv(r),
+        r.done > 0,
+    ensures
+        inv(remove_done(r)),
+{
+}
+
+pub proof fn abandon_preserves(r: Reg)
+    requires
+        inv(r),
+        r.active == 0,
+        r.done == 0,
+    ensures
+        inv(abandon(r)),
+        abandon(r).released == r.accepted,
+        !abandon(r).running,
+{
+}
+
 pub proof fn sweep_preserves(r: Reg)
     requires
         inv(r),
@@ -256,12 +314,15 @@ pub enum Ev {
     Sweep,
     /// The thread stops.
     Exit,
+    /// The thread could not be started.
+    Abandon,
 }
 
 pub open spec fn step(s: St, e: Ev) -> St {
     match s {
         St::Queued => match e {
             Ev::Drain => St::Active,
+            Ev::Abandon => St::Released,
             _ => St::Queued,
         },
         St::Active => match e {
@@ -271,6 +332,7 @@ pub open spec fn step(s: St, e: Ev) -> St {
             _ => St::Active,
         },
         St::Done => match e {
+            Ev::Remove => St::Released,
             Ev::Sweep => St::Released,
             Ev::Exit => St::Released,
             _ => St::Done,
@@ -314,7 +376,8 @@ pub proof fn released_is_final(e: Ev)
 pub proof fn queued_not_called(e: Ev)
     ensures
         !calls(St::Queued, e),
-        step(St::Queued, e) == St::Queued || step(St::Queued, e) == St::Active,
+        step(St::Queued, e) == St::Queued || step(St::Queued, e) == St::Active
+            || step(St::Queued, e) == St::Released,
 {
 }
 

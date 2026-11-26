@@ -166,6 +166,18 @@ pub fn connect(
     lport: u16,
     async_: bool,
 ) -> io::Result<RawFd> {
+    sock_connect(host, port, lhost, lport, async_).map(|(fd, _)| fd)
+}
+
+/// [`connect`], also returning the error of a connect left in progress
+/// (the `errno` `SockConnect` leaves behind).
+fn sock_connect(
+    host: &str,
+    port: u16,
+    lhost: Option<&str>,
+    lport: u16,
+    async_: bool,
+) -> io::Result<(RawFd, Option<io::Error>)> {
     let unknown = || io::Error::new(io::ErrorKind::NotFound, "unknown host");
     let sa = get_sock_addr(Some(host), port).ok_or_else(unknown)?;
     let lsa = get_sock_addr(lhost, lport).ok_or_else(unknown)?;
@@ -174,6 +186,7 @@ pub fn connect(
         set_blocking(fd, false)?;
     }
     let s = sockaddr(sa);
+    let mut in_progress = None;
     // SAFETY: s is a valid sockaddr_in of SALEN bytes.
     if let Err(e) = cvt(unsafe { libc::connect(fd, (&raw const s).cast(), SALEN) }) {
         let pending = matches!(
@@ -184,15 +197,20 @@ pub fn connect(
             close(fd);
             return Err(e);
         }
+        in_progress = Some(e);
     }
     if async_ {
         set_blocking(fd, true)?;
     }
-    Ok(fd)
+    Ok((fd, in_progress))
 }
 
 /// Connect, waiting at most `timeout` for the connection
 /// (`Ns_SockTimedConnect2`).
+///
+/// As in AOLserver, a connect that times out or fails once in progress
+/// reports the error the non-blocking `connect()` left behind
+/// (`EINPROGRESS`), not the socket's `SO_ERROR` or a timeout.
 pub fn timed_connect(
     host: &str,
     port: u16,
@@ -200,10 +218,12 @@ pub fn timed_connect(
     lport: u16,
     timeout: Duration,
 ) -> io::Result<RawFd> {
-    let fd = connect(host, port, lhost, lport, true)?;
+    let (fd, in_progress) = sock_connect(host, port, lhost, lport, true)?;
+    let in_progress =
+        || in_progress.unwrap_or_else(|| io::Error::from_raw_os_error(libc::EINPROGRESS));
     if !wait(fd, libc::POLLOUT, Some(timeout)) {
         close(fd);
-        return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+        return Err(in_progress());
     }
     let mut err: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -217,13 +237,14 @@ pub fn timed_connect(
             &raw mut len,
         )
     };
-    if rc != 0 || err != 0 {
+    if rc != 0 {
+        let e = io::Error::last_os_error();
         close(fd);
-        return Err(io::Error::from_raw_os_error(if rc == 0 {
-            err
-        } else {
-            libc::EIO
-        }));
+        return Err(e);
+    }
+    if err != 0 {
+        close(fd);
+        return Err(in_progress());
     }
     Ok(fd)
 }
@@ -371,7 +392,9 @@ mod tests {
             close(fd);
         }
         assert!(connect("127.0.0.1", port, None, 0, false).is_err());
-        assert!(timed_connect("127.0.0.1", port, None, 0, Duration::from_secs(5)).is_err());
+        let e =
+            timed_connect("127.0.0.1", port, None, 0, Duration::from_secs(5)).expect_err("refused");
+        assert_eq!(e.raw_os_error(), Some(libc::EINPROGRESS));
         assert!(connect("no.such.host.invalid", 1, None, 0, false).is_err());
         assert!(listen(Some("no.such.host.invalid"), 0, 5).is_err());
         assert!(accept(-1).is_err());

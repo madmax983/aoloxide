@@ -408,8 +408,10 @@ pub fn get_index(name: &str, table: &[&str], what: &str) -> Result<usize, Except
     };
     let mut msg = format!("{kind} {what} \"{name}\": must be ");
     for (i, t) in table.iter().enumerate() {
-        if i + 1 == table.len() && table.len() > 1 {
+        if i + 1 == table.len() && table.len() > 2 {
             msg.push_str(", or ");
+        } else if i + 1 == table.len() && i > 0 {
+            msg.push_str(" or ");
         } else if i > 0 {
             msg.push_str(", ");
         }
@@ -603,6 +605,11 @@ mod tests {
             .starts_with("ambiguous option \"c\": must be create, copy, or delete"));
         let e = get_index("zz", &t, "option").expect_err("bad");
         assert!(e.message.starts_with("bad option"));
+        // Tcl_GetIndexFromObj: no comma before "or" with two entries.
+        let e = get_index("x", &["in", "out"], "event").expect_err("bad");
+        assert_eq!(e.message, "bad event \"x\": must be in or out");
+        let e = get_index("x", &["only"], "event").expect_err("bad");
+        assert_eq!(e.message, "bad event \"x\": must be only");
     }
 
     #[test]
