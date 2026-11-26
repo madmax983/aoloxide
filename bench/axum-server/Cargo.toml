@@ -1,0 +1,31 @@
+[package]
+name = "axum-bench-server"
+description = "axum baseline server for benchmarking aoloxide (see bench/README.md)"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MPL-1.1 OR GPL-2.0-or-later"
+
+# Standalone: keeps axum/tower-http out of the aoloxide workspace and its lockfile.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+tower-http = { version = "0.6", features = ["fs"] }
+mime_guess = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+# Same allowance as the aoloxide workspace.
+option_if_let_else = "allow"
+
+[profile.release]
+lto = "thin"

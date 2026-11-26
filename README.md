@@ -86,6 +86,12 @@ $ cargo test --workspace
 Formal proofs of core invariants live in [`verus/`](verus) and are checked in
 CI with [Verus](https://github.com/verus-lang/verus).
 
+## Performance
+
+[`bench/`](bench) compares aoloxide with an equivalent axum server under wrk;
+results and a profile of where aoloxide's time goes are in
+[docs/benchmarks.md](docs/benchmarks.md).
+
 ## Running
 
 ```console
