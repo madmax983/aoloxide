@@ -26,6 +26,7 @@ intentional behavioural deviation, and tracks what is not yet ported.
 | `nsd/nsconf.c`, `info.c` | `nsd/src/global.rs`, `cmds/info.rs` |
 | `nsd/server.c` | `nsd/src/server.rs` |
 | `nsd/driver.c`, `nssock/` | `nsd/src/driver.rs` |
+| `nsd/fd.c` (`Ns_GetTemp`), `NsConnContent`, `Ns_ConnContentFd` | `nsd/src/content.rs` |
 | `nsd/queue.c`, `pools.c`, `limits.c` | `nsd/src/queue.rs`, `pool.rs` |
 | `nsd/conn.c`, `connio.c`, `return.c` | `nsd/src/conn.rs`, `cmds/conn.rs` |
 | `nsd/op.c`, `filter.c`, `auth.c` | `nsd/src/op.rs` |
@@ -54,7 +55,7 @@ intentional behavioural deviation, and tracks what is not yet ported.
 | `nscp/` | `crates/nscp` |
 | `nsdb/` | `crates/nsdb` (`driver.rs`: driver trait + SQLite) |
 | `nsproxy/nsproxylib.c`, `nsproxy.c` | `crates/nsproxy` (`src/bin/nsproxy.rs` is the worker) |
-| `nsd/dstring.c`, `index.c`, `lisp.c`, `str.c`, `dsprintf.c`, `fd.c`, `binder.c` | replaced by the Rust standard library |
+| `nsd/dstring.c`, `index.c`, `lisp.c`, `str.c`, `dsprintf.c`, `fd.c` (except temp files), `binder.c` | replaced by the Rust standard library |
 
 ## Intentional deviations
 
@@ -68,9 +69,22 @@ HTTP handling:
 2. **Chunked request bodies** are decoded and **`Expect: 100-continue`** is
    honoured.
 3. **Malformed requests get a status line** (400, 413, 414) before the
-   socket closes; AOLserver mostly dropped them silently.
-4. **Bodies over `maxinput`** are rejected with 413.  There is no temp-file
-   spooling yet (phase 2).
+   socket closes; AOLserver mostly dropped them silently.  This includes a
+   request line and headers that do not end within the driver's
+   `maxinput` (`E_RRANGE`, 400).  As in AOLserver, `maxheader` is read but
+   not used.
+4. **Bodies over the request's `ns_limits` `maxupload`** (default 10 MB)
+   are rejected with 413 before they are read; AOLserver closed the socket
+   without a reply.  As in AOLserver, a body whose request (line, headers,
+   body and a trailing CRLF) reaches the driver's `maxinput` is spooled to
+   an unlinked temp file (`Ns_GetTemp`) instead of memory, and the file
+   returns to the temp-file pool when the connection is done.  A request
+   without a `Content-Length` counts as a 0-byte body there, so its empty
+   body is spooled too when the head alone reaches `maxinput`.  Temp
+   files are created in `/tmp` (`P_tmpdir`, `TMPDIR` is ignored), and
+   `nscgi` gives the CGI the temp file as its standard input.  Chunked
+   bodies (deviation 2) take the same first decision, then spill to a
+   temp file when the next chunk would reach `maxinput`.
 5. **`+` in a URL path is a literal plus.**  AOLserver decoded `+` as a
    space in paths as well as in query strings.
 6. **A request that produced no response gets a 500** (for example a
@@ -233,10 +247,26 @@ Modules:
     accepted, are dropped, closing their descriptors (modelled as
     `abandon` in `verus/sockcallback.rs`).
 
+29. **(spooling)** A spooled body is read into memory on its first
+    whole-body use (`ns_conn content` without a range, form parsing), where
+    AOLserver `mmap`ed the temp file; `ns_conn content off len`,
+    `ns_conn copy` and `ns_writecontent` read the file a piece at a time.
+    `ns_conn contentchannel` opens the connection's temp file through
+    `/dev/fd`: on Linux each channel has its own file offset starting at
+    the beginning of the content, where AOLserver's `dup()` shared one
+    offset, so a second channel opened after reading the first started at
+    end of file.
+30. **(spooling)** A body refused for `maxupload` counts in the limits'
+    `ndropped` (`ns_limits get`), which AOLserver never incremented.  A
+    temp file that cannot be created or written is always logged as an
+    error (AOLserver logged it only with the driver's `debug` on); in
+    both, the socket is closed without a reply and no driver statistic
+    changes.
+
 ## Not yet supported (phase 2)
 
 These commands exist but return a clear `not supported` error:
-`ns_conn contentchannel`.
+none.
 
 Modules still to port:
 
@@ -244,7 +274,6 @@ Modules still to port:
 |---|---|
 | `nsext`, `nspd` | external database proxy protocol, as an `nsdb` driver |
 
-Also planned: spooling large uploads to temp files.
 
 ## Formal verification
 
@@ -257,6 +286,7 @@ Also planned: spooling large uploads to temp files.
 | `pool.rs` | pool transitions keep `idle ≤ current ≤ max`; enqueue never strands work while there is capacity |
 | `cache.rs` | inserts keep total size ≤ max; eviction removes only LRU entries |
 | `chan.rs` | `ns_chan` ownership: a channel is registered in some interp, held by the server's shared table, or closed, never two of these; `create`/`put` cut only an unshared channel, `get` gives it to exactly one interp |
+| `spool.rs` | request-body read-ahead: `mem + disk = read ≤ len ≤ maxupload`, one sink only (a spooled body buffers nothing, an in-memory request stays under `maxinput`), receives never over-read; chunked bodies spill without losing bytes |
 | `proxy.rs` | nsproxy handle accounting (`avail + out = max`, idle workers ≤ spare capacity under any interleaving of get, release and config, including a config between a failed `get`'s pops and its give-back; a failed `get` restores the pool) and the `Idle → Busy → Done → Idle` proxy state machine |
 | `sockcallback.rs` | socket callback registry accounting (`queued + active + done + released = accepted`, nothing held once stopped), registrations refused once shutdown is pending so `stop` releases every callback, removal of entries awaiting the sweep, dropping the queue when the thread cannot start, and the `Queued → Active → Done → Released` callback life cycle: never called after returning false or being released |
 

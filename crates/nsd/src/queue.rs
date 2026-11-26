@@ -107,7 +107,6 @@ fn run_incoming(
         ..ConnFlags::default()
     };
     let query_encoding = server.input_encoding_for(&request.method, &request.url);
-    let too_large = content.len() > limits.config().maxupload;
     let conn = Conn {
         id: server.global.next_conn_id(),
         request,
@@ -141,12 +140,6 @@ fn run_incoming(
         que_waits: crate::quewait::QueWaits::default(),
     };
     let ctx = ConnCtx::new(Arc::clone(server), conn);
-    if too_large {
-        limits.drop_upload();
-        let _ = ctx.return_too_large();
-        finish(&ctx, Status::Ok);
-        return;
-    }
     let status = conn_run(&ctx);
     finish(&ctx, status);
 }

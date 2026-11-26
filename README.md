@@ -24,6 +24,7 @@ Phase 1 (this release) ports the server core and the most-used modules:
 |---|---|
 | Config (`nsconfig.tcl`, `ns_section`/`ns_param`) | ✅ |
 | Socket driver (`nssock`): keep-alive, pipelining, chunked requests, `100-continue`, limits | ✅ |
+| Request-body spooling to temp files (`maxinput`/`maxupload`), `ns_conn contentchannel` | ✅ (phase 3) |
 | Connection thread pools, `ns_pools`, `ns_limits` | ✅ |
 | Request pipeline: filters, auth hook, request procs, traces, cleanups, redirects | ✅ |
 | Fastpath (static files, index files, conditional GET, caching) | ✅ |

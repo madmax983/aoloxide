@@ -798,6 +798,186 @@ fn adp_commands() {
     err(&srv, "ns_adp_flush", "no adp output context");
 }
 
+/// Open descriptors on (unlinked) `nstmp.*` spool files.
+fn open_spool_files() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|l| l.to_string_lossy().contains("/nstmp."))
+        .count()
+}
+
+fn post(srv: &TestServer, url: &str, ty: &str, body: &str) -> Response {
+    Response::parse(&srv.raw(&format!(
+        "POST {url} HTTP/1.0\r\nContent-Type: {ty}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )))
+}
+
+#[test]
+fn spooled_request_content() {
+    let srv = TestServer::start(
+        "ns_section ns/server/s1/module/nssock\nns_param maxinput 4096\n",
+        |home| {
+            let lib = home.join("servers/s1/modules/tcl");
+            std::fs::create_dir_all(&lib).unwrap();
+            std::fs::write(
+                lib.join("t.tcl"),
+                r#"
+ns_register_proc POST /spool spool_proc
+proc spool_proc {} {
+    set ch [ns_conn contentchannel]
+    fconfigure $ch -translation binary
+    set data [read $ch]
+    close $ch
+    set ch2 [ns_conn contentchannel]
+    set n2 [string length [read $ch2]]
+    close $ch2
+    ns_return 200 text/plain [list [ns_conn contentlength] [expr {[ns_conn flags] & 0x80}] \
+        [string length $data] $n2 [string equal $data [ns_conn content]] [ns_queryget a] \
+        [ns_conn content 2 3] [ns_conn contentavail]]
+}
+ns_register_proc POST /indices indices_proc
+proc indices_proc {} {
+    set n [ns_conn contentlength]
+    set r {}
+    foreach args [list [list -1 1] [list [expr {$n + 1}] 0] [list 0 [expr {$n + 1}]] [list 1 -1] [list 0]] {
+        catch {ns_conn content {*}$args} m
+        lappend r $m
+    }
+    catch {ns_conn copy 0 1} m
+    lappend r [string match "wrong # args*off len chan*" $m] [string length [ns_conn content $n 0]]
+    ns_return 200 text/plain [join $r |]
+}
+ns_register_proc POST /copy copy_proc
+proc copy_proc {} {
+    set tmp [ns_tmpnam]
+    set f [open $tmp w]
+    ns_conn copy 2 [expr {[ns_conn contentlength] - 2}] $f
+    ns_conn copy 0 0 $f
+    close $f
+    set f [open $tmp]
+    set head [read $f 4]
+    close $f
+    set sz [file size $tmp]
+    set f [open $tmp w]
+    ns_writecontent $f
+    close $f
+    set wsz [file size $tmp]
+    file delete $tmp
+    ns_return 200 text/plain [list $sz $head $wsz [ns_conn contentavail]]
+}
+ns_register_proc GET /flags flags_proc
+proc flags_proc {} {
+    ns_return 200 text/plain [list [expr {[ns_conn flags] & 0x80}] [ns_conn contentlength]]
+}
+ns_register_proc POST /nul nul_proc
+proc nul_proc {} {
+    ns_return 200 text/plain [list [string length [ns_conn content]] \
+        [string length [ns_conn content 0 [ns_conn contentlength]]]]
+}
+ns_register_proc POST /upload upload_proc
+proc upload_proc {} {
+    set form [ns_getform]
+    set tmp [ns_getformfile f]
+    set f [open $tmp]
+    fconfigure $f -translation binary
+    set head [read $f 5]
+    close $f
+    ns_return 200 text/plain [list [ns_set get $form a] [file size $tmp] [ns_conn filelength f] \
+        [expr {[ns_conn flags] & 0x80}] [ns_set get $form f.content-type] $head]
+}
+"#,
+            )
+            .unwrap();
+        },
+    );
+    let form = "application/x-www-form-urlencoded";
+    // A body whose request reaches maxinput is spooled, and every content
+    // accessor sees it.
+    let big = format!("a=1&b={}", "x".repeat(6000));
+    let r = post(&srv, "/spool", form, &big);
+    assert_eq!(r.status, 200, "{r:?} {:?}", srv.log());
+    assert_eq!(r.body, "6006 128 6006 6006 1 1 1&b 6006");
+    // In-memory content: contentchannel copies it to a temp file.
+    let r = post(&srv, "/spool", form, "a=2&b=y");
+    assert_eq!(r.body, "7 0 7 7 1 2 2&b 7");
+    // GetIndices.
+    let r = post(&srv, "/indices", form, &big);
+    assert_eq!(
+        r.body,
+        "invalid offset: -1|invalid offset: 6007|invalid length: 6007|invalid length: -1|\
+         wrong # args: should be \"ns_conn content ?off len?\"|1|0",
+        "{:?}",
+        srv.log()
+    );
+    let r = post(&srv, "/copy", form, &big);
+    assert_eq!(r.body, "6004 1&b= 6006 0");
+    // Without a range, `ns_conn content` is a C string: it stops at the
+    // first NUL, in memory or spooled.
+    for n in [10, 1000] {
+        let r = post(&srv, "/nul", "text/plain", &"ab\0cd".repeat(n));
+        assert_eq!(r.body, format!("2 {}", 5 * n));
+    }
+    // The request line and headers must end within maxinput (E_RRANGE).
+    let mut many = String::from("GET /flags HTTP/1.0\r\n");
+    for n in 0..70 {
+        many.push_str(&format!("X-H{n}: {}\r\n", "v".repeat(90)));
+    }
+    many.push_str("\r\n");
+    assert_eq!(Response::parse(&srv.raw(&many)).status, 400);
+    // A bodiless request whose head reaches maxinput - 2 still spools its
+    // (empty) content, as `SockReadLine` does with len = 0.
+    let head = |total: usize| {
+        let base = "GET /flags HTTP/1.0\r\nX-Pad: \r\n\r\n".len();
+        format!(
+            "GET /flags HTTP/1.0\r\nX-Pad: {}\r\n\r\n",
+            "p".repeat(total - base)
+        )
+    };
+    assert_eq!(Response::parse(&srv.raw(&head(4094))).body, "128 0");
+    assert_eq!(Response::parse(&srv.raw(&head(4093))).body, "0 0");
+    // A multipart upload whose file part makes the body spill to disk.
+    let file: String = (0..8000u32)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    let body = format!(
+        "--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nval\r\n\
+         --XyZ\r\nContent-Disposition: form-data; name=\"f\"; filename=\"big.txt\"\r\n\
+         Content-Type: text/x-big\r\n\r\n{file}\r\n--XyZ--\r\n"
+    );
+    let r = post(&srv, "/upload", "multipart/form-data; boundary=XyZ", &body);
+    assert_eq!(
+        r.body,
+        "val 8000 8000 128 text/x-big abcde",
+        "{:?}",
+        srv.log()
+    );
+    // Spool files go back to the pool when the connection is done: every
+    // open spool file is a pooled one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while open_spool_files() > nsd::content::pooled_temps() {
+        assert!(std::time::Instant::now() < deadline, "spool files leaked");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(nsd::content::pooled_temps() >= 1);
+    // maxupload, not maxinput, refuses a body.
+    ok(
+        &srv,
+        "ns_limits set small -maxupload 5000; ns_limits register small s1 POST /spool; expr 1",
+        "1",
+    );
+    let r = post(&srv, "/spool", form, &big);
+    assert_eq!(r.status, 413);
+    ok(
+        &srv,
+        "array set l [ns_limits get small]; set l(ndropped)",
+        "1",
+    );
+    let r = post(&srv, "/spool", form, "a=3&b=z");
+    assert_eq!(r.status, 200, "{r:?} {:?}", srv.log());
+}
+
 #[test]
 fn commands_without_a_connection_fail_clearly() {
     let srv = TestServer::start("", |_| {});

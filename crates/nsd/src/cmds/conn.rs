@@ -10,6 +10,7 @@ use ns_script::{
 use super::set::{enter_set, lookup_set};
 use super::{bool_str, cmd, conn, int_arg, io_ok, status_arg};
 use crate::conn::{lock_set, set_ref, ConnRef};
+use crate::content::Content;
 use crate::interp::ns_interp;
 
 /// Commands defined here.
@@ -197,49 +198,39 @@ fn ns_conn(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
             String::new()
         }
         "content" => {
+            if argv.len() != 2 && argv.len() != 4 {
+                return Err(wrong_args(&argv, 2, "?off len?"));
+            }
             let cc = c.conn();
-            let data = &cc.content;
-            let (off, len) = match (arg(2), arg(3)) {
-                (Some(o), Some(l)) => (int_arg(o)?.max(0) as usize, int_arg(l)?.max(0) as usize),
-                _ => (0, data.len()),
+            let slice = if argv.len() == 4 {
+                let (off, len) = content_indices(&cc.content, &argv[2], &argv[3])?;
+                cc.content.read_at(off, len).map_err(content_error)?
+            } else {
+                // `Tcl_SetResult(interp, Ns_ConnContent(conn), TCL_STATIC)`:
+                // a C string, so the body ends at its first NUL.
+                let all = cc.content.bytes().unwrap_or_default();
+                let end = all.iter().position(|&b| b == 0).unwrap_or(all.len());
+                all[..end].to_vec()
             };
-            let end = off.saturating_add(len).min(data.len());
-            let slice = &data[off.min(end)..end];
             match cc.query_encoding {
-                Some(e) => e.decode_without_bom_handling(slice).0.into_owned(),
-                None => {
-                    String::from_utf8(slice.to_vec()).unwrap_or_else(|_| bytes_to_binary(slice))
-                }
+                Some(e) => e.decode_without_bom_handling(&slice).0.into_owned(),
+                None => String::from_utf8(slice).unwrap_or_else(|e| bytes_to_binary(e.as_bytes())),
             }
         }
         "contentavail" => {
             let cc = c.conn();
             (cc.content.len() - cc.content_offset.min(cc.content.len())).to_string()
         }
+        "contentchannel" => content_channel(interp, &c)?,
         "contentlength" => c.conn().content.len().to_string(),
         "contentsentlength" => c.conn().n_content_sent.to_string(),
         "copy" => {
-            let (off, len, chan) = match (arg(2), arg(3), arg(4)) {
-                (Some(o), Some(l), Some(ch)) => (
-                    int_arg(o)?.max(0) as usize,
-                    int_arg(l)?.max(0) as usize,
-                    ch.to_owned(),
-                ),
-                _ => return Err(wrong_args(&argv, 2, "off len chan")),
-            };
-            let data = {
-                let cc = c.conn();
-                let end = off.saturating_add(len).min(cc.content.len());
-                bytes_to_binary(&cc.content[off.min(end)..end])
-            };
-            write_channel(interp, &chan, &data)?;
+            if argv.len() != 5 {
+                return Err(wrong_args(&argv, 2, "off len chan"));
+            }
+            let (off, len) = content_indices(&c.conn().content, &argv[2], &argv[3])?;
+            copy_content(interp, &c, off, len, &argv[4])?;
             String::new()
-        }
-        "contentchannel" => {
-            return Err(Exception::error(format!(
-                "ns_conn {opt}: not supported by the {} engine bridge",
-                interp.engine()
-            )))
         }
         "channel" => conn_channel(interp, &c)?,
         "sock" => conn_sock(&c).to_string(),
@@ -286,7 +277,11 @@ fn ns_conn(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         }
         "flags" => {
             let f = c.conn().flags;
-            let mut n = 0u32;
+            let mut n = if c.conn().content.file_content() {
+                0x80
+            } else {
+                0
+            };
             for (b, v) in [
                 (f.closed, 0x1),
                 (f.skip_hdrs, 0x2),
@@ -376,11 +371,59 @@ fn ns_conn(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     })
 }
 
-/// Write `data` (binary string) to a script channel.
-fn write_channel(interp: &dyn Interp, chan: &str, data: &str) -> Result<(), Exception> {
+/// Check `off len` against the content (`GetIndices`).
+fn content_indices(content: &Content, off: &str, len: &str) -> Result<(usize, usize), Exception> {
+    let total = i64::try_from(content.len()).unwrap_or(i64::MAX);
+    let o = int_arg(off)?;
+    let l = int_arg(len)?;
+    if o < 0 || o > total {
+        return Err(Exception::error(format!("invalid offset: {off}")));
+    }
+    if l < 0 || l > total - o {
+        return Err(Exception::error(format!("invalid length: {len}")));
+    }
+    // Both are within 0..=content.len() here.
+    Ok((o as usize, l as usize))
+}
+
+fn content_error(e: std::io::Error) -> Exception {
+    Exception::error(format!("could not get content: {e}"))
+}
+
+/// Bytes copied to a channel per write by `ns_conn copy`.
+const COPY_CHUNK: usize = 64 * 1024;
+
+/// Write `len` content bytes from `off` to a channel (`ns_conn copy`),
+/// a piece at a time so a spooled body is never wholly in memory.
+fn copy_content(
+    interp: &dyn Interp,
+    c: &ConnRef,
+    off: usize,
+    len: usize,
+    chan: &str,
+) -> Result<(), Exception> {
     interp.eval_words(&["fconfigure", chan, "-translation", "binary"])?;
-    interp.eval_words(&["puts", "-nonewline", chan, data])?;
+    let mut pos = off;
+    let end = off + len;
+    while pos < end {
+        let n = (end - pos).min(COPY_CHUNK);
+        let data = c.conn().content.read_at(pos, n).map_err(content_error)?;
+        interp.eval_words(&["puts", "-nonewline", chan, &bytes_to_binary(&data)])?;
+        pos += n;
+    }
     Ok(())
+}
+
+/// `ns_conn contentchannel`: a readable channel on a temp file holding the
+/// content (`Ns_ConnContentFd`, copying in-memory content there first).
+/// As in AOLserver the result is empty when no temp file can be had.  The
+/// channel is opened through `/dev/fd`, so closing it leaves the
+/// connection's file open.
+fn content_channel(interp: &dyn Interp, c: &ConnRef) -> ScriptResult {
+    let Ok(fd) = c.content_fd() else {
+        return Ok(String::new());
+    };
+    interp.eval_words(&["open", &format!("/dev/fd/{fd}"), "r"])
 }
 
 /// Read up to `len` bytes (all if `None`) from a script channel.
@@ -610,16 +653,16 @@ fn ns_writecontent(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
         .ok_or_else(|| wrong_args(&argv, 1, "?-bytes tocopy? channel"))?
         .clone();
     let c = conn(interp)?;
-    let data = {
+    let (start, end) = {
         let mut cc = c.conn_mut();
         let start = cc.content_offset.min(cc.content.len());
         let end = bytes.map_or(cc.content.len(), |b| {
             start.saturating_add(b).min(cc.content.len())
         });
         cc.content_offset = end;
-        bytes_to_binary(&cc.content[start..end])
+        (start, end)
     };
-    write_channel(interp, &chan, &data)?;
+    copy_content(interp, &c, start, end - start, &chan)?;
     Ok(String::new())
 }
 

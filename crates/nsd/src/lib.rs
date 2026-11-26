@@ -21,6 +21,7 @@ pub mod adp;
 pub mod callbacks;
 pub mod cmds;
 pub mod conn;
+pub mod content;
 pub mod driver;
 pub mod fastpath;
 pub mod global;
