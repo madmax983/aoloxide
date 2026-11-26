@@ -837,6 +837,50 @@ const fn is_c_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
+/// Load the driver `name` listed in `ns/db/drivers` (`NsDbLoadDriver`):
+/// a registered driver module is initialised from `ns/db/driver/<name>`,
+/// otherwise a built-in driver is looked up by module or name.
+fn load_driver(
+    c: &Config,
+    log: &Logger,
+    home: Option<&std::path::Path>,
+    avail: &HashMap<&'static str, Arc<dyn DbDriver>>,
+    name: &str,
+) -> Option<Arc<dyn DbDriver>> {
+    let (_, file) = c
+        .section("ns/db/drivers")?
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))?;
+    let key = nsd::module::module_key(name, file.unwrap_or(""));
+    if let Some(f) = driver_factory(&key).or_else(|| driver_factory(name)) {
+        let dc = DriverConfig {
+            name,
+            path: format!("ns/db/driver/{name}"),
+            config: c,
+            home,
+            log,
+        };
+        return match f(&dc) {
+            Ok(d) => Some(d),
+            Err(d) => {
+                log(
+                    Severity::Error,
+                    &format!("dbdrv: failed to load driver '{name}'"),
+                );
+                d
+            }
+        };
+    }
+    let d = avail.get(key.as_str()).or_else(|| avail.get(name)).cloned();
+    if d.is_none() {
+        log(
+            Severity::Error,
+            &format!("dbdrv: no such driver: {name} ({})", file.unwrap_or("")),
+        );
+    }
+    d
+}
+
 /// Per-server settings (`ServData`).
 #[derive(Debug, Clone, Default)]
 struct ServData {
@@ -879,45 +923,10 @@ impl DbState {
     /// `ns/db/driver/<name>` (`NsDbLoadDriver`).
     pub fn build_in(c: &Config, log: &Logger, home: Option<&std::path::Path>) -> Self {
         let avail = drivers();
-        let mut names: HashMap<String, Arc<dyn DbDriver>> = HashMap::new();
-        if let Some(sec) = c.section("ns/db/drivers") {
-            for (name, file) in sec.iter() {
-                let key = nsd::module::module_key(name, file.unwrap_or(""));
-                if let Some(f) = driver_factory(&key).or_else(|| driver_factory(name)) {
-                    let dc = DriverConfig {
-                        name,
-                        path: format!("ns/db/driver/{name}"),
-                        config: c,
-                        home,
-                        log,
-                    };
-                    match f(&dc) {
-                        Ok(d) => {
-                            names.insert(name.to_owned(), d);
-                        }
-                        Err(d) => {
-                            log(
-                                Severity::Error,
-                                &format!("dbdrv: failed to load driver '{name}'"),
-                            );
-                            if let Some(d) = d {
-                                names.insert(name.to_owned(), d);
-                            }
-                        }
-                    }
-                    continue;
-                }
-                match avail.get(key.as_str()).or_else(|| avail.get(name)) {
-                    Some(d) => {
-                        names.insert(name.to_owned(), Arc::clone(d));
-                    }
-                    None => log(
-                        Severity::Error,
-                        &format!("dbdrv: no such driver: {name} ({})", file.unwrap_or("")),
-                    ),
-                }
-            }
-        }
+        // Drivers are loaded the first time a pool names them
+        // (`CreatePool` -> `NsDbLoadDriver`), so an `ns/db/drivers` entry
+        // no pool uses is never initialised.
+        let mut loaded: HashMap<String, Option<Arc<dyn DbDriver>>> = HashMap::new();
         let mut pools = BTreeMap::new();
         if let Some(sec) = c.section("ns/db/pools") {
             for (name, desc) in sec.iter() {
@@ -933,7 +942,11 @@ impl DbState {
                     );
                     continue;
                 };
-                let Some(drv) = names.get(dname).or_else(|| avail.get(dname)).cloned() else {
+                let drv = loaded
+                    .entry(dname.to_owned())
+                    .or_insert_with(|| load_driver(c, log, home, &avail, dname))
+                    .clone();
+                let Some(drv) = drv.or_else(|| avail.get(dname).cloned()) else {
                     log(
                         Severity::Error,
                         &format!("dbinit: no such driver '{dname}' for pool '{name}'"),
@@ -1261,6 +1274,20 @@ fn sp_unsupported(opt: &str, h: &Handle) -> Exception {
     ))
 }
 
+/// Whether `ns_db opt` may run a stored-procedure call on `h`.  As in
+/// `Ns_DbSpStart` and the other `Ns_DbSp*` functions, a disconnected
+/// handle fails with `Database operation "opt" failed`; a connected
+/// driver without stored procedures gets the "not supported" error.
+fn sp_check(opt: &str, h: &Handle) -> Result<(), Exception> {
+    if !h.connected() {
+        return Err(failed(opt, h));
+    }
+    if !h.supports_sp() {
+        return Err(sp_unsupported(opt, h));
+    }
+    Ok(())
+}
+
 /// `ns_db` (`DbObjCmd`).
 fn ns_db(interp: &dyn Interp, argv: &[String], db: &DbState, server: &str) -> ScriptResult {
     let (_, opt) = nsd::cmds::subcommand(argv, &OPTS)?;
@@ -1296,9 +1323,7 @@ fn ns_db(interp: &dyn Interp, argv: &[String], db: &DbState, server: &str) -> Sc
             }
             let inout = ["in", "out"][ns_script::get_index(&argv[5], &["in", "out"], "option")?];
             with_handle(interp, &argv[2], true, |h| {
-                if !h.supports_sp() {
-                    return Err(sp_unsupported(opt, h));
-                }
+                sp_check(opt, h)?;
                 if h.sp_setparam(&argv[3], &argv[4], inout, &argv[6]) {
                     Ok("1".to_owned())
                 } else {
@@ -1371,9 +1396,7 @@ fn handle_cmd(interp: &dyn Interp, opt: &str, id: &str) -> ScriptResult {
     }
     if opt == "sp_getparams" {
         let params = with_handle(interp, id, true, |h| {
-            if !h.supports_sp() {
-                return Err(sp_unsupported(opt, h));
-            }
+            sp_check(opt, h)?;
             h.sp_getparams().ok_or_else(|| failed(opt, h))
         })??;
         let mut set = NsSet::default();
@@ -1384,6 +1407,9 @@ fn handle_cmd(interp: &dyn Interp, opt: &str, id: &str) -> ScriptResult {
     }
     with_handle(interp, id, true, |h| {
         let p = Arc::clone(&h.pool);
+        if opt.starts_with("sp_") {
+            sp_check(opt, h)?;
+        }
         Ok(match opt {
             "cancel" => {
                 if !h.cancel() {
@@ -1400,12 +1426,12 @@ fn handle_cmd(interp: &dyn Interp, opt: &str, id: &str) -> ScriptResult {
             "connected" => nsd::cmds::bool_str(h.connected()),
             "datasource" => p.datasource.clone(),
             "dbtype" => h.db_type(),
-            "sp_exec" if h.supports_sp() => match h.sp_exec() {
+            "sp_exec" => match h.sp_exec() {
                 Ok(ExecResult::Dml(_)) => "NS_DML".to_owned(),
                 Ok(ExecResult::Rows(_)) => "NS_ROWS".to_owned(),
                 Err(_) => return Err(failed(opt, h)),
             },
-            "sp_returncode" if h.supports_sp() => match h.sp_returncode() {
+            "sp_returncode" => match h.sp_returncode() {
                 Some(code) => code,
                 None => return Err(failed(opt, h)),
             },
@@ -1422,8 +1448,7 @@ fn handle_cmd(interp: &dyn Interp, opt: &str, id: &str) -> ScriptResult {
                 }
                 "0".to_owned()
             }
-            "user" => p.user.clone().unwrap_or_default(),
-            _ => return Err(sp_unsupported(opt, h)),
+            _ => p.user.clone().unwrap_or_default(),
         })
     })?
 }
@@ -1496,9 +1521,7 @@ fn handle_sql_cmd(interp: &dyn Interp, opt: &str, id: &str, arg: &str) -> Script
         }
         _ => with_handle(interp, id, true, |h| {
             // sp_start
-            if !h.supports_sp() {
-                return Err(sp_unsupported(opt, h));
-            }
+            sp_check(opt, h)?;
             if h.sp_start(arg) {
                 Ok("0".to_owned())
             } else {

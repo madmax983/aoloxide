@@ -24,7 +24,7 @@ fn insufficient(argv0: &str, usage: &str) -> Exception {
 }
 
 /// A result: a string, or a list built once the handle is released.
-enum Out {
+pub(crate) enum Out {
     Str(String),
     List(Vec<String>),
 }
@@ -53,7 +53,7 @@ pub fn ns_ext(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     })
 }
 
-fn ext_cmd(e: &mut ExtConn, argv: &[String]) -> Result<Out, Exception> {
+pub(crate) fn ext_cmd(e: &mut ExtConn, argv: &[String]) -> Result<Out, Exception> {
     let argv0 = argv[0].as_str();
     let nargs = |n: usize, usage: &str| {
         if argv.len() == n {
@@ -148,7 +148,7 @@ fn ext_cmd(e: &mut ExtConn, argv: &[String]) -> Result<Out, Exception> {
 /// A reply that must be `ok`; otherwise the reply is the error.
 fn expect_ok(e: &mut ExtConn, what: &str) -> Result<(), String> {
     let r = e
-        .get_string(RSP_BUFSIZE)
+        .get_status(RSP_BUFSIZE)
         .ok_or_else(|| format!("Can't get {what} status response from Proxy Daemon"))?;
     if r.eq_ignore_ascii_case(msg::OK_STATUS) {
         Ok(())
@@ -268,7 +268,7 @@ fn delete_remote(e: &mut ExtConn, path: &str) -> Result<(), String> {
         return Err("Unable to send DeleteF command Proxy Daemon".into());
     }
     let r = e
-        .get_string(RSP_BUFSIZE)
+        .get_status(RSP_BUFSIZE)
         .ok_or("Unable to get DeleteF status response from Proxy Daemon")?;
     if r.eq_ignore_ascii_case(msg::OK_STATUS) {
         Ok(())

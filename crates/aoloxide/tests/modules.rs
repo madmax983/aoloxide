@@ -553,10 +553,11 @@ fn nsdb_handle_subcommands_and_misconfig() {
     .unwrap();
     std::fs::write(dir.path().join("x.csv"), " a , b ,\"c \",\n\n").unwrap();
     let extra = format!(
-        "ns_section ns/db/drivers\nns_param sqlite nssqlite.so\nns_param bogus nsbogus.so\n\
-         ns_section ns/db/pools\nns_param one One\nns_param nodrv x\nns_param baddrv x\nns_param nods x\nns_param hidden H\n\
+        "ns_section ns/db/drivers\nns_param sqlite nssqlite.so\nns_param bogus nsbogus.so\nns_param unloaded nsunloaded.so\n\
+         ns_section ns/db/pools\nns_param one One\nns_param bogusdrv x\nns_param nodrv x\nns_param baddrv x\nns_param nods x\nns_param hidden H\n\
          ns_section ns/db/pool/one\nns_param driver sqlite\nns_param datasource {db}\nns_param connections 1\n\
          ns_param user scott\nns_param password tiger\nns_param verbose on\nns_param logsqlerrors on\n\
+         ns_section ns/db/pool/bogusdrv\nns_param driver bogus\nns_param datasource x\n\
          ns_section ns/db/pool/nodrv\nns_param datasource x\n\
          ns_section ns/db/pool/baddrv\nns_param driver nosuch\nns_param datasource x\n\
          ns_section ns/db/pool/nods\nns_param driver sqlite\n\
@@ -791,6 +792,8 @@ proc dbx_proc {} {
     ] {
         assert!(log.contains(want), "missing {want:?} in {log}");
     }
+    // A driver no pool names is never loaded.
+    assert!(!log.contains("unloaded"), "{log}");
 }
 
 #[test]

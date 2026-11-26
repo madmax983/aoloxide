@@ -108,7 +108,9 @@ Modules:
 17. `nsdb` ships a SQLite driver (`sqlite`) in place of AOLserver's
     external C drivers.  The SQLite driver buffers a query's rows when it
     runs; on drivers without stored procedures (SQLite) `ns_db sp_*`
-    return a "not supported" error.
+    on a connected handle return a "not supported" error (on a
+    disconnected handle they fail with `Database operation "sp_..."
+    failed`, as in AOLserver, whatever the driver).
 18. `ns_proxy active pool` lists checked-out handles that are evaluating.
     AOLserver walked the pool's *free* list, so it always returned an
     empty list.
@@ -167,8 +169,10 @@ Modules:
 29. **nsext:** Driver modules are compiled in and registered with
     `nsdb::register_driver`; `ns_param external nsext.so` in
     `ns/db/drivers` loads `nsext` from `ns/db/driver/external` as
-    `Ns_DbDriverInit` did.  A driver whose config is unusable is still
-    registered (as in AOLserver) and its handles fail to open.
+    `Ns_DbDriverInit` did, when a pool first names the driver
+    (`NsDbLoadDriver`); an entry no pool uses is never initialised.  A
+    driver whose config is unusable is still registered (as in
+    AOLserver) and its handles fail to open.
 30. **nsext:** Replies are read through a buffer instead of being peeked
     (`MSG_PEEK`) and then read, so a reply line split across packets is
     no longer a protocol error.  Lines must still fit AOLserver's buffers
@@ -231,7 +235,7 @@ the tokio runtime, and channel transfer for `ns_chan`.
 | `glob.rs` | an executable `*`/`?` matcher equals the recursive spec; literal and `*` lemmas |
 | `pool.rs` | pool transitions keep `idle ≤ current ≤ max`; enqueue never strands work while there is capacity |
 | `cache.rs` | inserts keep total size ≤ max; eviction removes only LRU entries |
-| `extproto.rs` | the nsext/nspd protocol: for every message nsext sends, the daemon's reply has the number of items nsext reads (on `ok` and on error); the connection returns to `Ready` after exactly one reply, never sends while a reply is outstanding, and stays `Dead` after an I/O or framing error; unanswered messages are never sent |
+| `extproto.rs` | the nsext/nspd protocol: for every message nsext sends, the daemon's reply has the number of items nsext reads (on `ok` and on error); the connection returns to `Ready` after exactly one reply, never sends while a reply is outstanding, and stays `Dead` after an I/O or framing error; unanswered messages are never sent; list elements are read only for sizes within `maxElementSize` and a list ends only at `-1`.  nsext tracks the unread items of each reply from `Msg::reply` (the model's table) and drops a connection that falls out of step; the daemon is tested against the same table for every message |
 | `proxy.rs` | nsproxy handle accounting (`avail + out = max`, idle workers ≤ spare capacity under any interleaving of get, release and config, including a config between a failed `get`'s pops and its give-back; a failed `get` restores the pool) and the `Idle → Busy → Done → Idle` proxy state machine |
 
 The production implementations are additionally checked against the same

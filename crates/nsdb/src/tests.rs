@@ -630,9 +630,17 @@ fn driver_modules_load_from_their_config() {
         c.put(&format!("ns/db/pool/p{n}"), "datasource", "x");
     }
     c.put("ns/db/driver/good", "opt", "1");
+    // Drivers no pool names are never loaded (`NsDbLoadDriver` runs per
+    // pool), and a driver two pools share is loaded once.
+    c.put("ns/db/drivers", "unused", "nstestext.so");
+    c.put("ns/db/drivers", "nomodule", "nsnomodule.so");
+    c.put("ns/db/pools", "pgood2", "");
+    c.put("ns/db/pool/pgood2", "driver", "good");
+    c.put("ns/db/pool/pgood2", "datasource", "y");
     let (log, logs) = capture();
     let st = DbState::build_in(&c, &log, Some(std::path::Path::new("/home")));
     assert!(st.get_pool("pgood").is_some() && st.get_pool("phalf").is_some());
+    assert!(st.get_pool("pgood2").is_some());
     assert!(st.get_pool("pbad").is_none());
     assert_eq!(
         lock(&made).clone(),
@@ -650,5 +658,10 @@ fn driver_modules_load_from_their_config() {
     ] {
         assert!(l.contains(&m.to_owned()), "{m} {l:?}");
     }
+    assert!(
+        !l.iter()
+            .any(|m| m.contains("unused") || m.contains("nomodule")),
+        "{l:?}"
+    );
     assert!(driver_factory("nosuch").is_none());
 }

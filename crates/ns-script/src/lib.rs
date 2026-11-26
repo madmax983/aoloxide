@@ -325,13 +325,14 @@ pub fn get_index(name: &str, table: &[&str], what: &str) -> Result<usize, Except
     if let Some(i) = table.iter().position(|t| *t == name) {
         return Ok(i);
     }
+    // An empty key abbreviates every entry but never selects one.
     let matches: Vec<usize> = table
         .iter()
         .enumerate()
-        .filter(|(_, t)| !name.is_empty() && t.starts_with(name))
+        .filter(|(_, t)| t.starts_with(name))
         .map(|(i, _)| i)
         .collect();
-    if matches.len() == 1 {
+    if matches.len() == 1 && !name.is_empty() {
         return Ok(matches[0]);
     }
     let kind = if matches.len() > 1 {
@@ -339,14 +340,24 @@ pub fn get_index(name: &str, table: &[&str], what: &str) -> Result<usize, Except
     } else {
         "bad"
     };
-    let mut msg = format!("{kind} {what} \"{name}\": must be ");
-    for (i, t) in table.iter().enumerate() {
-        if i + 1 == table.len() && table.len() > 1 {
-            msg.push_str(", or ");
-        } else if i > 0 {
+    let mut msg = format!("{kind} {what} \"{name}\": ");
+    let Some((first, rest)) = table.split_first() else {
+        msg.push_str("no valid options");
+        return Err(Exception::error(msg));
+    };
+    // `Tcl_GetIndexFromObjStruct`: "a or b", "a, b, or c".
+    msg.push_str("must be ");
+    msg.push_str(first);
+    let mut shown = 0;
+    for (i, t) in rest.iter().enumerate() {
+        if i + 1 == rest.len() {
+            msg.push_str(if shown > 0 { ", or " } else { " or " });
+            msg.push_str(t);
+        } else if !t.is_empty() {
             msg.push_str(", ");
+            msg.push_str(t);
+            shown += 1;
         }
-        msg.push_str(t);
     }
     Err(Exception::error(msg))
 }
@@ -536,6 +547,25 @@ mod tests {
             .starts_with("ambiguous option \"c\": must be create, copy, or delete"));
         let e = get_index("zz", &t, "option").expect_err("bad");
         assert!(e.message.starts_with("bad option"));
+        // Tcl_GetIndexFromObj's wording: no comma before "or" with two
+        // choices, an empty key is ambiguous among several.
+        let msg = |k: &str, t: &[&str]| get_index(k, t, "option").expect_err(k).message;
+        assert_eq!(
+            msg("sideways", &["in", "out"]),
+            "bad option \"sideways\": must be in or out"
+        );
+        assert_eq!(msg("x", &["a"]), "bad option \"x\": must be a");
+        assert_eq!(msg("", &["a"]), "bad option \"\": must be a");
+        assert_eq!(
+            msg("", &["in", "out"]),
+            "ambiguous option \"\": must be in or out"
+        );
+        assert_eq!(
+            msg("x", &["a", "", "c"]),
+            "bad option \"x\": must be a or c"
+        );
+        assert_eq!(msg("x", &[]), "bad option \"x\": no valid options");
+        assert_eq!(get_index("a", &["a"], "option"), Ok(0));
     }
 
     #[test]

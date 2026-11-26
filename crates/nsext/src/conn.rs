@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use ns_core::log::Severity;
 use nsdb::{DbConnection, DbError, ExecResult};
-use nspd::msg::{self, Msg};
+use nspd::msg::{self, Item, Msg};
 use nspd::strerror;
 
 use crate::Ctx;
@@ -125,14 +125,46 @@ fn read_line(r: &mut BufReader<Sock>, max: usize) -> Result<Vec<u8>, LineErr> {
     }
 }
 
+/// What a list element's size line means (`size_verdict` of
+/// `verus/extproto.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Size {
+    /// The `-1` terminator.
+    End,
+    /// An element of this many bytes.
+    Elem(usize),
+    /// Over `maxElementSize` (checked first, as in AOLserver).
+    TooBig,
+    /// Another negative size.
+    Bad,
+}
+
+/// `size_verdict`: the meaning of size `n` with element limit `max`.
+pub(crate) fn size_verdict(n: i64, max: i64) -> Size {
+    if n > max {
+        Size::TooBig
+    } else if n == -1 {
+        Size::End
+    } else {
+        usize::try_from(n).map_or(Size::Bad, Size::Elem)
+    }
+}
+
 /// A connection to a proxy daemon (`NsExtConn`).  `io` is `None` once
 /// the connection has been cleaned up after an error (`DbProxyCleanup`);
 /// the handle is then disconnected.
+///
+/// `pending` is the connection state of `verus/extproto.rs`: the items
+/// of the outstanding reply still to read ([`Msg::reply`]), empty when
+/// the connection is ready.  A request sent while a reply is unread, or
+/// a read of an item the reply does not hold, is a protocol error that
+/// drops the connection (the model's `Dead`).
 pub struct ExtConn {
     io: Option<Io>,
     num: u32,
     ctx: Arc<Ctx>,
     ncols: usize,
+    pending: &'static [Item],
 }
 
 impl std::fmt::Debug for ExtConn {
@@ -168,6 +200,7 @@ impl ExtConn {
             num: ctx.next_conn_num(),
             ctx: Arc::clone(ctx),
             ncols: 0,
+            pending: &[],
         };
         let r = c.start().and_then(|()| {
             if !c.is_alive() {
@@ -307,8 +340,37 @@ impl ExtConn {
         }
     }
 
+    /// Whether no reply is outstanding (the model's `Ready`).
+    #[cfg(test)]
+    pub(crate) const fn in_step(&self) -> bool {
+        self.io.is_some() && self.pending.is_empty()
+    }
+
+    /// Account for reading one reply item of `kind`: it must be the next
+    /// item of the outstanding reply, or the connection is dropped.
+    fn take_item(&mut self, kind: Item) -> bool {
+        match self.pending.split_first() {
+            Some((&k, rest)) if k == kind => {
+                self.pending = rest;
+                true
+            }
+            _ => {
+                self.log(
+                    Severity::Bug,
+                    &format!(
+                        "nsext: protocol error: read a {kind:?} item, expected {:?} (connection {})",
+                        self.pending, self.num
+                    ),
+                );
+                self.cleanup();
+                false
+            }
+        }
+    }
+
     /// `DbProxyStop`.
     fn stop(&mut self) {
+        self.pending = &[];
         if self.io.take().is_some() {
             self.log(
                 Severity::Debug,
@@ -368,6 +430,22 @@ impl ExtConn {
             );
             return false;
         }
+        if self.io.is_none() {
+            return false;
+        }
+        if !self.pending.is_empty() {
+            self.log(
+                Severity::Bug,
+                &format!(
+                    "nsext: protocol error: '{}' sent with {} reply items unread (connection {})",
+                    m.name(),
+                    self.pending.len(),
+                    self.num
+                ),
+            );
+            self.cleanup();
+            return false;
+        }
         let buf = msg::encode(m, arg);
         let Some(io) = self.io.as_mut() else {
             return false;
@@ -390,11 +468,36 @@ impl ExtConn {
                 &format!("SENT |{}|", String::from_utf8_lossy(&buf)),
             );
         }
+        self.pending = m.reply();
         true
     }
 
-    /// `DbProxyGetString`: one reply line of fewer than `max` bytes.
+    /// `DbProxyGetString` for a plain reply line of fewer than `max`
+    /// bytes.
     pub(crate) fn get_string(&mut self, max: usize) -> Option<String> {
+        self.io.as_ref()?;
+        if !self.take_item(Item::Line) {
+            return None;
+        }
+        self.read_text(max)
+    }
+
+    /// `DbProxyGetString` for a reply's status line: anything but `ok`
+    /// ends the reply.
+    pub(crate) fn get_status(&mut self, max: usize) -> Option<String> {
+        self.io.as_ref()?;
+        if !self.take_item(Item::Status) {
+            return None;
+        }
+        let s = self.read_text(max)?;
+        if !s.eq_ignore_ascii_case(msg::OK_STATUS) {
+            self.pending = &[];
+        }
+        Some(s)
+    }
+
+    /// Read one line of fewer than `max` bytes (`DbProxyGetString`).
+    fn read_text(&mut self, max: usize) -> Option<String> {
         let io = self.io.as_mut()?;
         match read_line(&mut io.r, max) {
             Ok(line) => {
@@ -450,7 +553,7 @@ impl ExtConn {
     /// `DbProxyCheckStatus`: `ok`, or the exception `code#message` (a
     /// line without `#` is only logged, `silentError` is not reported).
     pub(crate) fn check_status(&mut self) -> Result<(), DbError> {
-        let s = self.get_string(STATUS_BUFSIZE).ok_or_else(no_exception)?;
+        let s = self.get_status(STATUS_BUFSIZE).ok_or_else(no_exception)?;
         if s.eq_ignore_ascii_case(msg::OK_STATUS) {
             return Ok(());
         }
@@ -491,9 +594,13 @@ impl ExtConn {
     /// element is a NULL value.  `None` after an error, which breaks the
     /// connection.
     pub(crate) fn get_list(&mut self) -> Option<Vec<Vec<u8>>> {
+        self.io.as_ref()?;
+        if !self.take_item(Item::List) {
+            return None;
+        }
         let mut out = Vec::new();
         loop {
-            let size = self.get_string(MAX_SIZEDIGITS)?;
+            let size = self.read_text(MAX_SIZEDIGITS)?;
             if !msg::all_digits(&size) {
                 self.log(
                     Severity::Error,
@@ -502,25 +609,26 @@ impl ExtConn {
                 self.cleanup();
                 return None;
             }
-            let n = msg::atoi(&size);
-            if n > self.ctx.max_element_size {
-                self.log(
-                    Severity::Error,
-                    &format!("nsext: exceeded element size limit of {n}"),
-                );
-                self.cleanup();
-                return None;
-            }
-            if n == -1 {
-                return Some(out);
-            }
-            let Ok(n) = usize::try_from(n) else {
-                self.log(
-                    Severity::Error,
-                    &format!("nsext: protocol error: number expected, got '{size}'"),
-                );
-                self.cleanup();
-                return None;
+            let raw = msg::atoi(&size);
+            let n = match size_verdict(raw, self.ctx.max_element_size) {
+                Size::Elem(n) => n,
+                Size::End => return Some(out),
+                Size::TooBig => {
+                    self.log(
+                        Severity::Error,
+                        &format!("nsext: exceeded element size limit of {raw}"),
+                    );
+                    self.cleanup();
+                    return None;
+                }
+                Size::Bad => {
+                    self.log(
+                        Severity::Error,
+                        &format!("nsext: protocol error: number expected, got '{size}'"),
+                    );
+                    self.cleanup();
+                    return None;
+                }
             };
             let mut data = vec![0; n];
             let io = self.io.as_mut()?;

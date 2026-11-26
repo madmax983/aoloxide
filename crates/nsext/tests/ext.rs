@@ -89,11 +89,18 @@ ns_param hostname localhost
     }
 }
 
-fn serve<D: PdDb + 'static>(f: impl Fn() -> D + Send + Sync + 'static) -> u16 {
+/// A daemon on a free port whose temporary files go to the returned
+/// directory (removed when the test ends).
+fn serve<D: PdDb + 'static>(f: impl Fn() -> D + Send + Sync + 'static) -> (u16, tempfile::TempDir) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
-    std::thread::spawn(move || nspd::serve(&l, move || Some(f()), &Options::default()));
-    port
+    let tmp = tempfile::tempdir().unwrap();
+    let opts = Options {
+        tmpdir: tmp.path().to_path_buf(),
+        ..Options::default()
+    };
+    std::thread::spawn(move || nspd::serve(&l, move || Some(f()), &opts));
+    (port, tmp)
 }
 
 fn pools(port: u16, ds: &str) -> String {
@@ -160,7 +167,9 @@ proc t_ext {} {
     while {[ns_db getrow $db $row]} { incr n }
     lappend out $n [ns_ext setmaxrows $db 0]
     lappend out [ns_ext resethandle $db]
-    lappend out [ns_ext traceon $db [ns_ext mktemp $db]] [ns_ext traceoff $db]
+    set trace [ns_ext mktemp $db]
+    lappend out [ns_ext traceon $db $trace] [ns_ext traceoff $db]
+    ns_ext rm $db $trace
     lappend out [catch {ns_ext traceon $db rel} m] $m
     lappend out [catch {ns_ext traceon $db} m] $m
     lappend out [catch {ns_ext setmaxrows $db x} m] $m
@@ -203,7 +212,7 @@ proc t_files {} {
 
 #[test]
 fn ns_db_through_a_remote_daemon() {
-    let port = serve(DriverDb::sqlite);
+    let (port, _tmp) = serve(DriverDb::sqlite);
     let dir = tempfile::tempdir().unwrap();
     let ds = dir.path().join("main.db").display().to_string();
     let srv = boot(&pools(port, &ds), SCRIPT);
@@ -227,7 +236,7 @@ fn ns_db_through_a_remote_daemon() {
 
 #[test]
 fn ns_ext_subcommands() {
-    let port = serve(DriverDb::sqlite);
+    let (port, tmp) = serve(DriverDb::sqlite);
     let dir = tempfile::tempdir().unwrap();
     let ds = dir.path().join("ext.db").display().to_string();
     let srv = boot(&pools(port, &ds), SCRIPT);
@@ -255,11 +264,14 @@ fn ns_ext_subcommands() {
         "TRACE",
     );
     assert_eq!(got, want.join(" "), "{out} {:?}", srv.logs());
+    // The trace file was made in the daemon's tmpdir and removed again.
+    assert!(out.contains(&tmp.path().display().to_string()), "{out}");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 #[test]
 fn remote_file_copies() {
-    let port = serve(DriverDb::sqlite);
+    let (port, tmp) = serve(DriverDb::sqlite);
     let dir = tempfile::tempdir().unwrap();
     let ds = dir.path().join("f.db").display().to_string();
     let tcl = format!(
@@ -281,6 +293,7 @@ fn remote_file_copies() {
     ] {
         assert!(out.contains(m), "{m}: {out}");
     }
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 /// A daemon with stored procedures: `spexec` runs the procedure name as
@@ -343,7 +356,7 @@ impl PdDb for SpDb {
 
 #[test]
 fn stored_procedures_through_ns_db() {
-    let port = serve(|| SpDb {
+    let (port, _tmp) = serve(|| SpDb {
         inner: DriverDb::sqlite(),
         proc_sql: String::new(),
         params: Vec::new(),
@@ -364,8 +377,14 @@ proc t_sp {} {
     lappend out [ns_db sp_start $db "create table s (a)"] [ns_db sp_exec $db]
     lappend out [catch {ns_db sp_getparams $db} m] $m
     lappend out [ns_db sp_start $db "select * from nosuch"] [catch {ns_db sp_exec $db} m] $m
+    ns_db disconnect $db
+    lappend out [catch {ns_db sp_start $db p} m] $m [catch {ns_db sp_setparam $db @a int in 1} m] $m
+    lappend out [catch {ns_db sp_exec $db} m] $m [catch {ns_db sp_returncode $db} m] $m
+    lappend out [catch {ns_db sp_getparams $db} m] $m
     ns_db releasehandle $db
     set lite [ns_db gethandle lite]
+    lappend out [catch {ns_db sp_exec $lite} m] $m
+    ns_db disconnect $lite
     lappend out [catch {ns_db sp_exec $lite} m] $m
     ns_db releasehandle $lite
     return $out
@@ -377,10 +396,14 @@ proc t_sp {} {
     let out = srv.get("/t?n=t_sp");
     assert_eq!(
         out,
-        "0 1 1 NS_ROWS 1 7 0 2 2 @a 5 @b x 1 {bad option \"sideways\": must be in, or out} \
+        "0 1 1 NS_ROWS 1 7 0 2 2 @a 5 @b x 1 {bad option \"sideways\": must be in or out} \
          0 NS_DML 1 {Database operation \"sp_getparams\" failed} \
          0 1 {Database operation \"sp_exec\" failed (exception Unknown, \"no such table: nosuch\")} \
-         1 {ns_db sp_exec: stored procedures are not supported by the sqlite driver}",
+         1 {Database operation \"sp_start\" failed} 1 {Database operation \"sp_setparam\" failed} \
+         1 {Database operation \"sp_exec\" failed} 1 {Database operation \"sp_returncode\" failed} \
+         1 {Database operation \"sp_getparams\" failed} \
+         1 {ns_db sp_exec: stored procedures are not supported by the sqlite driver} \
+         1 {Database operation \"sp_exec\" failed}",
         "{:?}",
         srv.logs()
     );

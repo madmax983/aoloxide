@@ -469,3 +469,171 @@ fn sends_need_their_argument() {
 }
 
 use nspd::msg::Msg;
+
+#[test]
+fn every_reply_is_read_in_step() {
+    // Each request gets a reply of exactly the items `Msg::reply` lists
+    // (a failed status alone); the client must read all of them and be
+    // ready again (`verus/extproto.rs`).
+    let ok = |s: &str| s.as_bytes().to_vec();
+    let (mut c, _, logs) = open_fake(
+        vec![
+            ("exec", ok("ok\nexec_dml\n")),
+            ("exec", ok("E#bad\n")),
+            ("bindrow", ok("ok\n1\na-1\n")),
+            ("bindrow", ok("E#bad\n")),
+            ("getrow", ok("ok\n1\n1-1\n")),
+            ("getrow", ok("E#bad\n")),
+            ("flush", ok("ok\n")),
+            ("cancel", ok("E#bad\n")),
+            ("resethandle", ok("ok\n")),
+            ("spstart", ok("ok\n")),
+            ("spsetparam", ok("E#bad\n")),
+            ("spexec", ok("ok\nexec_rows\n")),
+            ("spexec", ok("E#bad\n")),
+            ("spreturncode", ok("7\n")),
+            ("spgetparams", ok("ok\n2\n@a-1\n1\n1-1\n")),
+            ("spgetparams", ok("E#bad\n")),
+            ("ping", ok("ok\n")),
+            ("traceon", ok("ok\n")),
+            ("traceoff", ok("ok\n")),
+            ("gettypes", ok("int text\n")),
+            ("resultid", ok("id\n")),
+            ("resultrows", ok("3\n")),
+            ("setmaxrows", ok("ok\n")),
+            ("createtmpfile", ok("ok\n/r/pd1\n")),
+            ("createtmpfile", ok("cannot\n")),
+            ("deletefile", ok("ok\n")),
+            ("deletefile", ok("cannot\n")),
+            ("openfile", ok("ok\n3\n")),
+            ("writefile", ok("ok\n")),
+            ("closefile", ok("ok\n")),
+            ("openfile", ok("ok\n4\n")),
+            ("readfile", ok("ok\n2\nhi-1\n")),
+            ("readfile", ok("ok\n0\n-1\n")),
+            ("closefile", ok("ok\n")),
+            ("openfile", ok("cannot\n")),
+            ("openfile", ok("ok\n5\n")),
+            ("readfile", ok("cannot\n")),
+            ("closefile", ok("cannot\n")),
+        ],
+        |_| {},
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::write(&src, "x").unwrap();
+    let dst = dir.path().join("dst").display().to_string();
+    let src = src.display().to_string();
+    let cmd = |c: &mut ExtConn, args: &[&str]| {
+        let mut argv = vec!["ns_ext".to_owned(), args[0].to_owned(), "nsdb0".to_owned()];
+        argv.extend(args[1..].iter().map(|a| (*a).to_owned()));
+        let r = cmd::ext_cmd(c, &argv).map(|o| match o {
+            cmd::Out::Str(s) => s,
+            cmd::Out::List(l) => l.join(" "),
+        });
+        assert!(c.in_step(), "{args:?} {r:?} {:?}", logs.lock().unwrap());
+        r
+    };
+    let step = |c: &ExtConn, what: &str| {
+        assert!(c.in_step(), "{what} {:?}", logs.lock().unwrap());
+    };
+    assert!(c.in_step());
+    assert!(c.exec("a").is_ok());
+    step(&c, "exec");
+    assert!(c.exec("b").is_err());
+    step(&c, "exec error");
+    assert!(c.bind_row().unwrap().is_ok());
+    step(&c, "bindrow");
+    assert!(c.bind_row().unwrap().is_err());
+    step(&c, "bindrow error");
+    assert!(c.next_row_n(1).unwrap().is_some());
+    step(&c, "getrow");
+    assert!(c.next_row_n(1).is_err());
+    step(&c, "getrow error");
+    assert!(c.try_flush().is_ok());
+    assert!(c.cancel().is_err());
+    assert!(c.reset().is_ok());
+    assert!(c.sp_start("p").is_ok());
+    assert!(c.sp_setparam("@a int in 1").is_err());
+    assert!(c.sp_exec().is_ok());
+    assert!(c.sp_exec().is_err());
+    assert_eq!(c.sp_returncode().unwrap(), "7");
+    assert_eq!(c.sp_getparams().unwrap().len(), 1);
+    assert!(c.sp_getparams().is_err());
+    step(&c, "stored procedures");
+    assert_eq!(cmd(&mut c, &["ping"]).unwrap(), "ok");
+    assert!(cmd(&mut c, &["traceon", "/t"]).is_ok());
+    assert!(cmd(&mut c, &["traceoff"]).is_ok());
+    assert_eq!(cmd(&mut c, &["gettypes"]).unwrap(), "int text");
+    assert_eq!(cmd(&mut c, &["resultid"]).unwrap(), "id");
+    assert_eq!(cmd(&mut c, &["resultrows"]).unwrap(), "3");
+    assert!(cmd(&mut c, &["setmaxrows", "1"]).is_ok());
+    assert_eq!(cmd(&mut c, &["mktemp"]).unwrap(), "/r/pd1");
+    assert!(cmd(&mut c, &["mktemp"]).is_err());
+    assert_eq!(cmd(&mut c, &["rm", "/r/pd1"]).unwrap(), "");
+    assert_eq!(cmd(&mut c, &["rm", "/r/pd1"]).unwrap(), "rm error: cannot");
+    assert_eq!(cmd(&mut c, &["cpto", &src, "/r/f"]).unwrap(), "");
+    assert_eq!(cmd(&mut c, &["cpfrom", &dst, "/r/f"]).unwrap(), "");
+    assert_eq!(std::fs::read(&dst).unwrap(), b"hi");
+    assert!(cmd(&mut c, &["cpfrom", &dst, "/r/f"]).is_err());
+    assert!(cmd(&mut c, &["cpfrom", &dst, "/r/f"]).is_err());
+    assert!(c.connected());
+}
+
+#[test]
+fn out_of_step_use_drops_the_connection() {
+    // A request sent while a reply is unread.
+    let (mut c, _, logs) = open_fake(vec![("exec", b"ok\nexec_dml\n".to_vec())], |_| {});
+    assert!(c.send(Msg::Exec, Some(b"x")));
+    assert!(!c.in_step());
+    assert!(!c.send(Msg::Ping, None));
+    assert!(!c.connected() && !c.in_step());
+    assert!(has(
+        &logs,
+        "Bug: nsext: protocol error: 'ping' sent with 2 reply items unread"
+    ));
+    // A read of an item the reply does not hold.
+    let (mut c, _, logs) = open_fake(vec![("ping", b"ok\n".to_vec())], |_| {});
+    assert!(c.send(Msg::Ping, None));
+    assert!(c.get_list().is_none());
+    assert!(!c.connected());
+    assert!(has(
+        &logs,
+        "Bug: nsext: protocol error: read a List item, expected [Line]"
+    ));
+    // Nothing is read once the reply is complete.
+    let (mut c, _, logs) = open_fake(vec![("ping", b"ok\n".to_vec())], |_| {});
+    assert!(c.send(Msg::Ping, None) && c.ping_reply());
+    assert!(c.get_status(10).is_none() && !c.connected());
+    assert!(has(
+        &logs,
+        "Bug: nsext: protocol error: read a Status item, expected []"
+    ));
+}
+
+#[test]
+fn list_sizes_follow_the_verus_model() {
+    use crate::conn::{size_verdict, Size};
+    // `list_framing` of verus/extproto.rs, over a range of sizes/limits.
+    for max in -3..=6 {
+        for n in -5..=8 {
+            let v = size_verdict(n, max);
+            if let Size::Elem(k) = v {
+                assert!(n >= 0 && n <= max && k == usize::try_from(n).unwrap());
+            }
+            if (0..=max).contains(&n) {
+                assert_eq!(v, Size::Elem(usize::try_from(n).unwrap()));
+            }
+            if v == Size::End {
+                assert_eq!(n, -1);
+            }
+            if n == -1 && max >= 0 {
+                assert_eq!(v, Size::End);
+            }
+            if n < -1 {
+                assert!(matches!(v, Size::TooBig | Size::Bad), "{n} {max}");
+            }
+            assert_eq!(v == Size::TooBig, n > max);
+        }
+    }
+}

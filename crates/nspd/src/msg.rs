@@ -142,8 +142,9 @@ impl Msg {
     /// The items of the reply nsext reads after sending this message,
     /// when its status (if any) is `ok`; a non-`ok` status ends the reply
     /// at once.  The table queries are never answered by `nspd` (and
-    /// never sent by nsext).  Proved to agree with the daemon in
-    /// `verus/extproto.rs`.
+    /// never sent by nsext).  This is `client_items` of
+    /// `verus/extproto.rs`, proved to agree with the daemon there; nsext's
+    /// `ExtConn` reads each reply by it.
     pub const fn reply(self) -> &'static [Item] {
         use Item::{Line, List, Status};
         match self {
@@ -243,18 +244,33 @@ mod tests {
 
     #[test]
     fn replies_mirror_the_verus_model() {
-        // `client_items` of verus/extproto.rs.
+        // `has_status`, `client_items` and `daemon_items` of
+        // verus/extproto.rs, transliterated.
+        let has_status = |c: u8| {
+            matches!(
+                c,
+                0 | 1 | 2 | 3 | 4 | 11 | 12 | 18 | 19 | 20 | 21 | 22 | 23 | 25 | 26 | 27 | 29
+            )
+        };
+        let client_items = |c: u8, ok: bool| match c {
+            _ if !has_status(c) || !ok => 1,
+            29 => 3,
+            0 | 27 | 18 | 23 | 1 | 2 | 20 => 2,
+            _ => 1,
+        };
         for m in Msg::all() {
+            let c = m.code();
             let r = m.reply();
-            let n = r.len();
-            match m.code() {
-                5..=7 => assert_eq!(n, 0),
-                29 => assert_eq!(n, 3),
-                0 | 1 | 2 | 18 | 20 | 23 | 27 => assert_eq!(n, 2),
-                _ => assert_eq!(n, 1),
+            if (5..=7).contains(&c) {
+                assert!(r.is_empty(), "{m:?}");
+                continue;
             }
-            if n > 1 {
-                assert_eq!(r[0], Item::Status);
+            assert_eq!(r.first() == Some(&Item::Status), has_status(c), "{m:?}");
+            assert_eq!(r.len(), client_items(c, true), "{m:?}");
+            // Only the first item can be a status.
+            assert!(r.iter().skip(1).all(|i| *i != Item::Status), "{m:?}");
+            if has_status(c) {
+                assert_eq!(client_items(c, false), 1);
             }
         }
     }

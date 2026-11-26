@@ -573,3 +573,192 @@ fn helpers() {
     (o.log)(Level::Notice, "ignored");
     assert!(format!("{:?}", DriverDb::sqlite()).contains("sqlite"));
 }
+
+/// A database whose every call succeeds or fails as `fail` says.
+struct Toggle {
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Toggle {
+    fn r<T>(&self, v: T) -> Result<T, PdError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(PdError::exception("E", "failed"))
+        } else {
+            Ok(v)
+        }
+    }
+}
+
+impl PdDb for Toggle {
+    fn open(&mut self, _: &OpenArgs) -> Result<(), PdError> {
+        self.r(())
+    }
+    fn close(&mut self) -> Result<(), PdError> {
+        self.r(())
+    }
+    fn identify(&mut self) -> String {
+        "Toggle Proxy Daemon v1".into()
+    }
+    fn get_types(&mut self) -> String {
+        "text".into()
+    }
+    fn exec(&mut self, _: &str) -> Result<PdExec, PdError> {
+        self.r(PdExec::Rows)
+    }
+    fn bind_row(&mut self) -> Result<Vec<String>, PdError> {
+        self.r(vec!["a".into(), "b".into()])
+    }
+    fn get_row(&mut self, _: i64) -> Result<Option<Vec<Option<String>>>, PdError> {
+        self.r(Some(vec![Some("1".into()), None]))
+    }
+    fn flush(&mut self) -> Result<(), PdError> {
+        self.r(())
+    }
+    fn set_max_rows(&mut self, _: &str) -> Result<(), PdError> {
+        self.r(())
+    }
+    fn reset_handle(&mut self) -> Result<(), PdError> {
+        self.r(())
+    }
+    fn sp_start(&mut self, _: &str) -> Result<(), PdError> {
+        self.r(())
+    }
+    fn sp_set_param(&mut self, _: &str) -> Result<(), PdError> {
+        self.r(())
+    }
+    fn sp_exec(&mut self) -> Result<PdExec, PdError> {
+        self.r(PdExec::Dml)
+    }
+    fn sp_get_params(&mut self) -> Result<Vec<(String, Option<String>)>, PdError> {
+        self.r(vec![("@a".into(), Some("1".into())), ("@b".into(), None)])
+    }
+}
+
+/// Read the reply to `m` item by item as [`msg::Msg::reply`] describes
+/// it (a status other than `ok` ends it), then check the session is in
+/// step: the next reply is the `ping`'s.  Returns the items read.
+fn read_reply(c: &mut Client, m: msg::Msg) -> Vec<String> {
+    let mut items = Vec::new();
+    for it in m.reply() {
+        match it {
+            msg::Item::Status => {
+                let s = c.line();
+                let ok = s == msg::OK_STATUS;
+                items.push(s);
+                if !ok {
+                    break;
+                }
+            }
+            msg::Item::Line => items.push(c.line()),
+            msg::Item::List => items.push(format!("{:?}", c.list())),
+        }
+    }
+    assert_eq!(c.ask("ping", ""), "ok", "{m:?} out of step after {items:?}");
+    items
+}
+
+#[test]
+fn every_reply_has_the_items_of_the_message_table() {
+    use msg::Msg;
+    let (o, _, dir) = opts();
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut c = Client::start(
+        Toggle {
+            fail: Arc::clone(&fail),
+        },
+        &o,
+    );
+    let trace = dir.path().join("trace").display().to_string();
+    let missing = dir.path().join("no/such/file").display().to_string();
+    let ask = |c: &mut Client, m: Msg, arg: &str| {
+        c.send(m.name(), arg.as_bytes());
+        read_reply(c, m)
+    };
+    // Status messages, first succeeding, then failing.
+    for failing in [false, true] {
+        fail.store(failing, std::sync::atomic::Ordering::SeqCst);
+        for (m, arg) in [
+            (Msg::Open, "ds#u#p#x"),
+            (Msg::Exec, "select 1"),
+            (Msg::BindRow, ""),
+            (Msg::GetRow, "2"),
+            (Msg::Flush, ""),
+            (Msg::Cancel, ""),
+            (Msg::SpStart, "p"),
+            (Msg::SpSetParam, "@a int in 1"),
+            (Msg::SpExec, ""),
+            (Msg::SpGetParams, ""),
+            (Msg::SetMaxRows, "3"),
+            (Msg::ResetHandle, ""),
+        ] {
+            let items = ask(&mut c, m, arg);
+            let want = if failing { 1 } else { m.reply().len() };
+            assert_eq!(items.len(), want, "{m:?} {items:?}");
+            if m.reply().first() == Some(&msg::Item::Status) {
+                assert_eq!(items[0] == "ok", !failing, "{m:?} {items:?}");
+            }
+        }
+    }
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    // Line messages.
+    for (m, arg) in [
+        (Msg::Ping, ""),
+        (Msg::Identify, ""),
+        (Msg::GetTypes, ""),
+        (Msg::ResultId, ""),
+        (Msg::ResultRows, ""),
+        (Msg::SpReturnCode, ""),
+        (Msg::TraceOn, trace.as_str()),
+        (Msg::TraceOff, ""),
+        (Msg::TraceOn, missing.as_str()),
+        (Msg::TraceOff, ""),
+    ] {
+        assert_eq!(ask(&mut c, m, arg).len(), 1, "{m:?}");
+    }
+    // Remote files, succeeding and then failing.
+    let tmp = ask(&mut c, Msg::CreateTmpF, "");
+    assert_eq!(tmp.len(), 2, "{tmp:?}");
+    let fd = ask(&mut c, Msg::OpenF, &format!("2#{}", tmp[1]));
+    assert_eq!(fd.len(), 2, "{fd:?}");
+    let fd = &fd[1];
+    for (m, arg) in [
+        (Msg::WriteF, format!("{fd}#0#2#hi")),
+        (Msg::ReadF, format!("{fd}#0#10")),
+        (Msg::CloseF, fd.clone()),
+        (Msg::DeleteF, tmp[1].clone()),
+    ] {
+        let items = ask(&mut c, m, &arg);
+        assert_eq!(items.len(), m.reply().len(), "{m:?} {items:?}");
+        assert_eq!(items[0], "ok");
+    }
+    for (m, arg) in [
+        (Msg::OpenF, format!("0#{missing}")),
+        (Msg::WriteF, "99#0#1#x".to_owned()),
+        (Msg::ReadF, "99#0#1".to_owned()),
+        (Msg::CloseF, "99".to_owned()),
+        (Msg::DeleteF, missing),
+    ] {
+        let items = ask(&mut c, m, &arg);
+        assert_eq!(items.len(), 1, "{m:?} {items:?}");
+        assert_ne!(items[0], "ok");
+    }
+    // `close` ends the session, so it comes last.
+    c.send("close", b"");
+    assert_eq!(c.line(), "ok");
+    assert!(c.eof());
+    c.finish();
+    // A failing close also gets a status alone.
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut c = Client::start(Toggle { fail }, &o);
+    c.send("close", b"");
+    assert_eq!(c.line(), "E#failed");
+    assert!(c.eof());
+    c.finish();
+    // A failing `createtmpfile` gets a status alone.
+    let mut o2 = o;
+    o2.tmpdir = dir.path().join("gone/");
+    let mut c = Client::start(DriverDb::sqlite(), &o2);
+    let items = ask(&mut c, Msg::CreateTmpF, "");
+    assert_eq!(items.len(), 1, "{items:?}");
+    c.finish();
+}

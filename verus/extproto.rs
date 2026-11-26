@@ -20,7 +20,19 @@
 //!   error moves to `Dead`, which is absorbing (the handle is cleaned up
 //!   and nothing more is sent: `DbProxyCleanup`);
 //! * a message that is never answered (`gettableinfo`, `tablelist`,
-//!   `bestrowid`) is never sent by nsext.
+//!   `bestrowid`) is never sent by nsext;
+//! * list framing: an element is read only for a size in
+//!   `0..=maxElementSize`, and a list ends only at `-1`.
+//!
+//! The code follows the model through `nspd::msg::Msg::reply`, the
+//! table of `client_items` (checked by `replies_mirror_the_verus_model`).
+//! nsext's `ExtConn` keeps the unread items of the outstanding reply
+//! (`Conn.left`): `send` takes them from `Msg::reply`, each read must be
+//! the next of them, and a request sent before they are all read, or a
+//! read the reply does not hold, drops the connection (`Dead`).  The
+//! daemon's replies (`daemon_items`) are checked against the same table
+//! for every message and both outcomes by nspd's
+//! `every_reply_has_the_items_of_the_message_table`.
 
 use vstd::prelude::*;
 
@@ -259,22 +271,32 @@ pub proof fn exchange_round_trip(code: int, ok: bool)
     }
 }
 
-/// List framing (`DbProxyGetList`): each element is a size line and the
-/// data; a list of `k` elements takes `2k + 1` lines/reads, the last
-/// one being the `-1` terminator, and every element read is within
-/// `maxElementSize`.
-pub open spec fn list_reads(k: nat) -> int {
-    2 * k + 1
+/// List framing (`DbProxyGetList`): what the size line `n` before each
+/// element means, given `maxElementSize` `max`.  0: the `-1` terminator;
+/// 1: an element of `n` bytes; 2: over the size limit (checked first, as
+/// in AOLserver); 3: any other negative size (a protocol error).  Mirrored
+/// by `size_verdict` in `crates/nsext/src/conn.rs`, which `get_list` uses.
+pub open spec fn size_verdict(n: int, max: int) -> int {
+    if n > max {
+        2
+    } else if n == -1 {
+        0
+    } else if n < 0 {
+        3
+    } else {
+        1
+    }
 }
 
-pub proof fn list_framing(k: nat, size: int, max: int)
-    requires
-        0 <= size,
-        size <= max,
+/// Every element read is a whole, non-negative size within the limit,
+/// every such size is read, and the list ends only at `-1`.
+pub proof fn list_framing(n: int, max: int)
     ensures
-        list_reads(k) >= 1,
-        list_reads(k + 1) == list_reads(k) + 2,
-        size <= max,
+        size_verdict(n, max) == 1 ==> 0 <= n && n <= max,
+        0 <= n && n <= max ==> size_verdict(n, max) == 1,
+        size_verdict(n, max) == 0 ==> n == -1,
+        n == -1 && max >= 0 ==> size_verdict(n, max) == 0,
+        n < -1 ==> size_verdict(n, max) >= 2,
 {
 }
 
