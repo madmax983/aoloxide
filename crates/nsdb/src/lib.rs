@@ -38,7 +38,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
-pub use driver::{DbConnection, DbDriver, DbError, ExecResult, SqliteDriver};
+pub use driver::{
+    driver_factory, register_driver, DbConnection, DbDriver, DbError, DriverConfig, DriverFactory,
+    ExecResult, SqliteDriver,
+};
 use ns_core::config::Config;
 use ns_core::log::Severity;
 use ns_core::NsSet;
@@ -197,6 +200,19 @@ impl Slot {
         self.atime = 0;
         self.otime = 0;
         self.stale = false;
+    }
+
+    /// Drop a connection its driver has given up on: the handle is no
+    /// longer connected (`DbProxyCleanup` clears `handle->connected`).
+    fn sync(&mut self) {
+        if self.conn.as_ref().is_some_and(|c| !c.connected()) {
+            self.disconnect();
+        }
+    }
+
+    /// Record a driver error as the handle's exception.
+    fn fail(&mut self, e: DbError) {
+        self.exception = (e.code, e.message);
     }
 }
 
@@ -440,9 +456,12 @@ impl Pool {
     /// Clean up a handle and return it (`Ns_DbPoolPutHandle`).
     fn put_slot(&self, mut s: Slot, owner: ThreadId) {
         if let Some(c) = s.conn.as_mut() {
-            c.flush();
-            let _ = c.reset();
+            let _ = c.try_flush();
+            if c.connected() {
+                let _ = c.reset();
+            }
         }
+        s.sync();
         s.columns.clear();
         s.exception = (String::new(), String::new());
         let t = now();
@@ -560,7 +579,7 @@ impl Handle {
 
     /// Whether the handle is connected.
     pub fn connected(&self) -> bool {
-        self.r().conn.is_some()
+        self.r().conn.as_ref().is_some_and(|c| c.connected())
     }
 
     /// The pending exception code and message.
@@ -615,29 +634,55 @@ impl Handle {
         }
     }
 
-    /// Execute SQL, recording any error as the exception (`Ns_DbExec`).
-    pub fn exec(&mut self, sql: &str) -> Result<ExecResult, DbError> {
+    /// Run `f` on the connection.  A driver error becomes the exception,
+    /// and a connection the driver has given up on is dropped.
+    fn call<R>(
+        &mut self,
+        f: impl FnOnce(&mut (dyn DbConnection + 'static)) -> Result<R, DbError>,
+    ) -> Result<R, DbError> {
         let s = self.s();
         let Some(c) = s.conn.as_mut() else {
             return Err(DbError::msg("handle not connected"));
         };
-        let r = c.exec(sql);
+        let r = f(c.as_mut());
+        if let Err(e) = &r {
+            s.fail(e.clone());
+        }
+        s.sync();
+        r
+    }
+
+    /// Run `f` on the driver's connection, if connected; a connection the
+    /// driver gives up on is dropped afterwards.  For driver-specific
+    /// commands such as `ns_ext`.
+    pub fn with_connection<R>(
+        &mut self,
+        f: impl FnOnce(&mut (dyn DbConnection + 'static)) -> R,
+    ) -> Option<R> {
+        self.call(|c| Ok(f(c))).ok()
+    }
+
+    /// Execute SQL, recording any error as the exception (`Ns_DbExec`).
+    pub fn exec(&mut self, sql: &str) -> Result<ExecResult, DbError> {
+        let r = self.call(|c| c.exec(sql));
+        let s = self.s();
         match &r {
             Ok(ExecResult::Rows(cols)) => s.columns.clone_from(cols),
             Ok(ExecResult::Dml(_)) => s.columns.clear(),
-            Err(e) => s.exception = (e.code.clone(), e.message.clone()),
+            Err(_) => {}
         }
         self.log_sql(sql);
         r
     }
 
-    /// Run a query and return its columns (`Ns_DbSelect`).
+    /// Run a query and return its columns (`Ns_DbSelect`: exec, then
+    /// bindrow).
     pub fn select(&mut self, sql: &str) -> Option<Vec<String>> {
         if !self.connected() {
             return None;
         }
-        if let Ok(ExecResult::Rows(cols)) = self.exec(sql) {
-            return Some(cols);
+        if let Ok(ExecResult::Rows(_)) = self.exec(sql) {
+            return self.bind_row();
         }
         if self.r().exception.1.is_empty() {
             self.set_exception("NSDB", "Query was not a statement returning rows.");
@@ -662,48 +707,81 @@ impl Handle {
     }
 
     /// The columns of the pending query (`Ns_DbBindRow`).
-    pub fn bind_row(&self) -> Option<Vec<String>> {
-        self.connected().then(|| self.r().columns.clone())
+    pub fn bind_row(&mut self) -> Option<Vec<String>> {
+        let cols = self.call(|c| c.bind_row().transpose()).ok()?;
+        let s = self.s();
+        if let Some(cols) = cols {
+            s.columns = cols;
+        }
+        Some(s.columns.clone())
     }
 
     /// The next row of the pending query, `None` at the end
     /// (`Ns_DbGetRow`).
     pub fn next_row(&mut self) -> Result<Option<Vec<Option<String>>>, DbError> {
-        let s = self.s();
-        let Some(c) = s.conn.as_mut() else {
-            return Err(DbError::msg("handle not connected"));
-        };
-        let r = c.next_row();
-        if let Err(e) = &r {
-            s.exception = (e.code.clone(), e.message.clone());
-        }
-        r
+        let n = self.r().columns.len();
+        self.next_row_n(n)
     }
 
-    /// Discard pending rows (`Ns_DbFlush`, `Ns_DbCancel`).
+    /// The next row for a row set of `ncols` columns (`Ns_DbGetRow`).
+    pub fn next_row_n(&mut self, ncols: usize) -> Result<Option<Vec<Option<String>>>, DbError> {
+        self.call(|c| c.next_row_n(ncols))
+    }
+
+    /// Discard pending rows (`Ns_DbFlush`).
     pub fn flush(&mut self) -> bool {
-        match self.s().conn.as_mut() {
-            Some(c) => {
-                c.flush();
-                true
-            }
-            None => false,
-        }
+        self.call(DbConnection::try_flush).is_ok()
+    }
+
+    /// Cancel the pending query (`Ns_DbCancel`).
+    pub fn cancel(&mut self) -> bool {
+        self.call(DbConnection::cancel).is_ok()
     }
 
     /// Reset the connection (`Ns_DbResetHandle`).
     pub fn reset(&mut self) -> bool {
-        let s = self.s();
-        let Some(c) = s.conn.as_mut() else {
-            return false;
-        };
-        match c.reset() {
-            Ok(()) => true,
-            Err(e) => {
-                s.exception = (e.code, e.message);
-                false
-            }
+        self.call(DbConnection::reset).is_ok()
+    }
+
+    /// The database type, empty when not connected (`Ns_DbDriverDbType`).
+    pub fn db_type(&self) -> String {
+        match &self.r().conn {
+            Some(c) => c
+                .db_type()
+                .unwrap_or_else(|| self.pool.driver.db_type().to_owned()),
+            None => String::new(),
         }
+    }
+
+    /// Whether the driver implements stored procedures.
+    pub fn supports_sp(&self) -> bool {
+        self.r().conn.as_ref().is_some_and(|c| c.supports_sp())
+    }
+
+    /// Begin a stored procedure (`Ns_DbSpStart`).
+    pub fn sp_start(&mut self, procname: &str) -> bool {
+        self.call(|c| c.sp_start(procname)).is_ok()
+    }
+
+    /// Set a stored-procedure parameter (`Ns_DbSpSetParam`).
+    pub fn sp_setparam(&mut self, name: &str, ty: &str, inout: &str, value: &str) -> bool {
+        let args = format!("{name} {ty} {inout} {value}");
+        self.call(|c| c.sp_setparam(&args)).is_ok()
+    }
+
+    /// Run the stored procedure (`Ns_DbSpExec`).
+    pub fn sp_exec(&mut self) -> Result<ExecResult, DbError> {
+        self.call(DbConnection::sp_exec)
+    }
+
+    /// The stored procedure's return code (`Ns_DbSpReturnCode`).
+    pub fn sp_returncode(&mut self) -> Option<String> {
+        self.call(DbConnection::sp_returncode).ok()
+    }
+
+    /// The stored procedure's output parameters (`Ns_DbSpGetParams`).
+    pub fn sp_getparams(&mut self) -> Option<Vec<(String, Option<String>)>> {
+        self.call(DbConnection::sp_getparams).ok()
     }
 
     /// Run a query expected to return at most one row: the columns and
@@ -759,6 +837,50 @@ const fn is_c_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
+/// Load the driver `name` listed in `ns/db/drivers` (`NsDbLoadDriver`):
+/// a registered driver module is initialised from `ns/db/driver/<name>`,
+/// otherwise a built-in driver is looked up by module or name.
+fn load_driver(
+    c: &Config,
+    log: &Logger,
+    home: Option<&std::path::Path>,
+    avail: &HashMap<&'static str, Arc<dyn DbDriver>>,
+    name: &str,
+) -> Option<Arc<dyn DbDriver>> {
+    let (_, file) = c
+        .section("ns/db/drivers")?
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))?;
+    let key = nsd::module::module_key(name, file.unwrap_or(""));
+    if let Some(f) = driver_factory(&key).or_else(|| driver_factory(name)) {
+        let dc = DriverConfig {
+            name,
+            path: format!("ns/db/driver/{name}"),
+            config: c,
+            home,
+            log,
+        };
+        return match f(&dc) {
+            Ok(d) => Some(d),
+            Err(d) => {
+                log(
+                    Severity::Error,
+                    &format!("dbdrv: failed to load driver '{name}'"),
+                );
+                d
+            }
+        };
+    }
+    let d = avail.get(key.as_str()).or_else(|| avail.get(name)).cloned();
+    if d.is_none() {
+        log(
+            Severity::Error,
+            &format!("dbdrv: no such driver: {name} ({})", file.unwrap_or("")),
+        );
+    }
+    d
+}
+
 /// Per-server settings (`ServData`).
 #[derive(Debug, Clone, Default)]
 struct ServData {
@@ -793,22 +915,18 @@ pub fn drivers() -> HashMap<&'static str, Arc<dyn DbDriver>> {
 impl DbState {
     /// Read pools from `config` (`NsDbInitPools`); messages go to `log`.
     pub fn build(c: &Config, log: &Logger) -> Self {
+        Self::build_in(c, log, None)
+    }
+
+    /// [`DbState::build`] for a server whose home is `home`; driver
+    /// modules registered with [`register_driver`] are initialised from
+    /// `ns/db/driver/<name>` (`NsDbLoadDriver`).
+    pub fn build_in(c: &Config, log: &Logger, home: Option<&std::path::Path>) -> Self {
         let avail = drivers();
-        let mut names: HashMap<String, Arc<dyn DbDriver>> = HashMap::new();
-        if let Some(sec) = c.section("ns/db/drivers") {
-            for (name, file) in sec.iter() {
-                let key = nsd::module::module_key(name, file.unwrap_or(""));
-                match avail.get(key.as_str()).or_else(|| avail.get(name)) {
-                    Some(d) => {
-                        names.insert(name.to_owned(), Arc::clone(d));
-                    }
-                    None => log(
-                        Severity::Error,
-                        &format!("dbdrv: no such driver: {name} ({})", file.unwrap_or("")),
-                    ),
-                }
-            }
-        }
+        // Drivers are loaded the first time a pool names them
+        // (`CreatePool` -> `NsDbLoadDriver`), so an `ns/db/drivers` entry
+        // no pool uses is never initialised.
+        let mut loaded: HashMap<String, Option<Arc<dyn DbDriver>>> = HashMap::new();
         let mut pools = BTreeMap::new();
         if let Some(sec) = c.section("ns/db/pools") {
             for (name, desc) in sec.iter() {
@@ -824,7 +942,11 @@ impl DbState {
                     );
                     continue;
                 };
-                let Some(drv) = names.get(dname).or_else(|| avail.get(dname)).cloned() else {
+                let drv = loaded
+                    .entry(dname.to_owned())
+                    .or_insert_with(|| load_driver(c, log, home, &avail, dname))
+                    .clone();
+                let Some(drv) = drv.or_else(|| avail.get(dname).cloned()) else {
                     log(
                         Severity::Error,
                         &format!("dbinit: no such driver '{dname}' for pool '{name}'"),
@@ -865,7 +987,7 @@ impl DbState {
                 g.log(sev, m);
             }
         });
-        let s = Self::build(&g.config, &log);
+        let s = Self::build_in(&g.config, &log, Some(&g.info.home));
         for p in s.pools.values() {
             let w = Arc::downgrade(p);
             let secs = u64::try_from(p.checkinterval).unwrap_or(0);
@@ -1100,6 +1222,17 @@ fn with_handle<R>(
     Ok(f(h))
 }
 
+/// Run `f` on handle `id` of `interp`, keeping its exception
+/// (`Ns_TclDbGetHandle`): for driver-specific commands such as `ns_ext`.
+/// No interp code may run in `f`.
+pub fn with_tcl_handle<R>(
+    interp: &dyn Interp,
+    id: &str,
+    f: impl FnOnce(&mut Handle) -> R,
+) -> Result<R, Exception> {
+    with_handle(interp, id, false, f)
+}
+
 const OPTS: [&str; 31] = [
     "getrow",
     "gethandle",
@@ -1141,6 +1274,20 @@ fn sp_unsupported(opt: &str, h: &Handle) -> Exception {
     ))
 }
 
+/// Whether `ns_db opt` may run a stored-procedure call on `h`.  As in
+/// `Ns_DbSpStart` and the other `Ns_DbSp*` functions, a disconnected
+/// handle fails with `Database operation "opt" failed`; a connected
+/// driver without stored procedures gets the "not supported" error.
+fn sp_check(opt: &str, h: &Handle) -> Result<(), Exception> {
+    if !h.connected() {
+        return Err(failed(opt, h));
+    }
+    if !h.supports_sp() {
+        return Err(sp_unsupported(opt, h));
+    }
+    Ok(())
+}
+
 /// `ns_db` (`DbObjCmd`).
 fn ns_db(interp: &dyn Interp, argv: &[String], db: &DbState, server: &str) -> ScriptResult {
     let (_, opt) = nsd::cmds::subcommand(argv, &OPTS)?;
@@ -1174,10 +1321,15 @@ fn ns_db(interp: &dyn Interp, argv: &[String], db: &DbState, server: &str) -> Sc
             if argv.len() != 7 {
                 return Err(wrong_args(argv, 2, "dbId paramname type in|out value"));
             }
-            ns_script::get_index(&argv[5], &["in", "out"], "option")?;
-            Err(with_handle(interp, &argv[2], true, |h| {
-                sp_unsupported(opt, h)
-            })?)
+            let inout = ["in", "out"][ns_script::get_index(&argv[5], &["in", "out"], "option")?];
+            with_handle(interp, &argv[2], true, |h| {
+                sp_check(opt, h)?;
+                if h.sp_setparam(&argv[3], &argv[4], inout, &argv[6]) {
+                    Ok("1".to_owned())
+                } else {
+                    Err(failed(opt, h))
+                }
+            })?
         }
         "gethandle" => gethandle(interp, argv, db, server),
         "bouncepool" => {
@@ -1242,10 +1394,30 @@ fn handle_cmd(interp: &dyn Interp, opt: &str, id: &str) -> ScriptResult {
         })??;
         return nsd::cmds::set::enter_set(interp, set_ref(columns_set(&cols)), false, false);
     }
+    if opt == "sp_getparams" {
+        let params = with_handle(interp, id, true, |h| {
+            sp_check(opt, h)?;
+            h.sp_getparams().ok_or_else(|| failed(opt, h))
+        })??;
+        let mut set = NsSet::default();
+        for (k, v) in &params {
+            set.put(k, Some(v.as_deref().unwrap_or("")));
+        }
+        return nsd::cmds::set::enter_set(interp, set_ref(set), true, false);
+    }
     with_handle(interp, id, true, |h| {
         let p = Arc::clone(&h.pool);
+        if opt.starts_with("sp_") {
+            sp_check(opt, h)?;
+        }
         Ok(match opt {
-            "cancel" | "flush" => {
+            "cancel" => {
+                if !h.cancel() {
+                    return Err(failed(opt, h));
+                }
+                String::new()
+            }
+            "flush" => {
                 if !h.flush() {
                     return Err(failed(opt, h));
                 }
@@ -1253,13 +1425,16 @@ fn handle_cmd(interp: &dyn Interp, opt: &str, id: &str) -> ScriptResult {
             }
             "connected" => nsd::cmds::bool_str(h.connected()),
             "datasource" => p.datasource.clone(),
-            "dbtype" => {
-                if h.connected() {
-                    p.driver.db_type().to_owned()
-                } else {
-                    String::new()
-                }
-            }
+            "dbtype" => h.db_type(),
+            "sp_exec" => match h.sp_exec() {
+                Ok(ExecResult::Dml(_)) => "NS_DML".to_owned(),
+                Ok(ExecResult::Rows(_)) => "NS_ROWS".to_owned(),
+                Err(_) => return Err(failed(opt, h)),
+            },
+            "sp_returncode" => match h.sp_returncode() {
+                Some(code) => code,
+                None => return Err(failed(opt, h)),
+            },
             "disconnect" => {
                 h.disconnect();
                 String::new()
@@ -1273,8 +1448,7 @@ fn handle_cmd(interp: &dyn Interp, opt: &str, id: &str) -> ScriptResult {
                 }
                 "0".to_owned()
             }
-            "user" => p.user.clone().unwrap_or_default(),
-            _ => return Err(sp_unsupported(opt, h)),
+            _ => p.user.clone().unwrap_or_default(),
         })
     })?
 }
@@ -1315,8 +1489,9 @@ fn handle_sql_cmd(interp: &dyn Interp, opt: &str, id: &str, arg: &str) -> Script
             // The set is looked up before a row is fetched (`Ns_TclGetSet2`).
             with_handle(interp, id, true, |_| ())?;
             let set = nsd::cmds::set::lookup_set(interp, arg, false)?;
+            let n = lock_set(&set).len();
             let row = with_handle(interp, id, false, |h| {
-                h.next_row().map_err(|_| failed(opt, h))
+                h.next_row_n(n).map_err(|_| failed(opt, h))
             })??;
             match row {
                 None => Ok("0".into()),
@@ -1344,7 +1519,15 @@ fn handle_sql_cmd(interp: &dyn Interp, opt: &str, id: &str, arg: &str) -> Script
             })??;
             nsd::cmds::set::enter_set(interp, set_ref(columns_set(&cols)), false, false)
         }
-        _ => Err(with_handle(interp, id, true, |h| sp_unsupported(opt, h))?),
+        _ => with_handle(interp, id, true, |h| {
+            // sp_start
+            sp_check(opt, h)?;
+            if h.sp_start(arg) {
+                Ok("0".to_owned())
+            } else {
+                Err(failed(opt, h))
+            }
+        })?,
     }
 }
 
@@ -1570,6 +1753,18 @@ pub fn init(ctx: &ModuleContext<'_>) -> Result<(), NsError> {
             Severity::Notice,
             &format!("dbinit: pool '{p}' available to server {}", server.name),
         );
+        // `NsDbDriverInit` for each pool the server may use.
+        if let Some(pool) = db.get_pool(&p) {
+            if let Err(e) = pool.driver.server_init(server) {
+                g.log(
+                    Severity::Warning,
+                    &format!(
+                        "dbdrv: init proc failed for driver '{}': {e}",
+                        pool.driver.name()
+                    ),
+                );
+            }
+        }
     }
     let (d, name) = (Arc::clone(&db), server.name.clone());
     server.add_command("ns_db", command(move |i, a| ns_db(i, a, &d, &name)));

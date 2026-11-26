@@ -18,7 +18,9 @@ $ ./target/release/nsd -f -t examples/nsconfig.tcl
 
 ## Status
 
-Phase 1 (this release) ports the server core and the most-used modules:
+All of AOLserver 4.5 is ported, in three phases (core and the most-used
+modules; the remaining modules; sockets, channels, spooling and
+`nsext`/`nspd`):
 
 | Area | State |
 |---|---|
@@ -30,15 +32,15 @@ Phase 1 (this release) ports the server core and the most-used modules:
 | Fastpath (static files, index files, conditional GET, caching) | ✅ |
 | ADP (`<% %>`, `<%= %>`, `<script runat=server>`, registered tags, includes, streaming) | ✅ |
 | Tcl interp lifecycle (`init.tcl`, `ns_ictl`, `ns_eval`, traces) | ✅ |
-| Socket commands (`ns_sockopen`, `ns_socklisten`, `ns_sockaccept`, `ns_socketpair`, `ns_sockselect`, `ns_sockcallback`, `ns_socklistencallback`, `ns_quewait`) on real Tcl channels, with the `-socks-` callback thread | ✅ |
+| Socket commands (`ns_sockopen`, `ns_socklisten`, `ns_sockaccept`, `ns_socketpair`, `ns_sockselect`, `ns_sockcallback`, `ns_socklistencallback`, `ns_quewait`) on real Tcl channels, with the `-socks-` callback thread | ✅ (phase 3) |
 | ~170 `ns_*` commands (`ns_conn`, `ns_return*`, `ns_set`, `nsv_*`, `ns_cache`, `ns_job`, `ns_thread`, `ns_sched*`, `ns_http`, ...) | ✅ |
 | `nslog` (access log), `nsperm` (Basic auth & permissions), `nscgi` (CGI/1.1) | ✅ |
 | `nsssl` (TLS via rustls), `nszlib`, `nscp` (control port), `nsdb` (SQLite driver), `nsproxy` (worker processes) | ✅ (phase 2) |
 | Channels and shared state: `ns_chan` (cross-thread transfer), `ns_conn channel\|sock\|interp`, `ns_adp_ctl channel`, `ns_adp_debug`, `ns_share`, `ns_ictl cancel` | ✅ (phase 3) |
-| `nsext`/`nspd` | Planned |
+| `nsext` (External database driver) and `nspd` (proxy daemon library, `nssqlitepd` SQLite daemon) | ✅ (phase 3) |
 
 See [docs/porting.md](docs/porting.md) for the C-to-Rust map, every
-intentional deviation, and the phase 2 plan.
+intentional deviation, and what is left to port.
 
 ## Architecture
 
@@ -60,8 +62,10 @@ flowchart LR
   that every `ns_*` command is written against.
 * **`ns-tcl`**: the Tcl 8.6 engine (FFI to libtcl).
 * **`nsd`**: the server core (`libnsd`).
-* **`nslog`, `nsperm`, `nscgi`, `nsssl`, `nszlib`, `nscp`, `nsdb`, `nsproxy`**: modules
+* **`nslog`, `nsperm`, `nscgi`, `nsssl`, `nszlib`, `nscp`, `nsdb`, `nsproxy`, `nsext`**: modules
   (`nsproxy` also builds the `nsproxy` worker binary; install it next to `nsd`).
+* **`nspd`**: the proxy-daemon side of nsext's protocol, and the
+  `nssqlitepd` daemon that serves SQLite databases to an `External` pool.
 * **`aoloxide`**: the `nsd` binary.
 
 Design decisions are recorded in [docs/adr](docs/adr).

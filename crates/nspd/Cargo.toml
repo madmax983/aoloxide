@@ -1,0 +1,20 @@
+[package]
+name = "nspd"
+description = "AOLserver nspd: the proxy-daemon side of the external database driver protocol, with an SQLite daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nssqlitepd"
+path = "src/bin/nssqlitepd.rs"
+
+[dependencies]
+nsdb = { path = "../nsdb" }
+libc.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
