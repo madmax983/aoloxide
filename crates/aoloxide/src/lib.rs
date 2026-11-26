@@ -11,8 +11,11 @@ use nsd::ModuleRegistry;
 
 /// All modules shipped with aoloxide, keyed by the names used in
 /// `ns/server/S/modules` (`nssock`, `nslog`, `nsperm`, `nscgi`, `nsssl`,
-/// `nsopenssl`, `nszlib`, `nscp`, `nsdb`, `nsproxy`).
+/// `nsopenssl`, `nszlib`, `nscp`, `nsdb`, `nsproxy`, `nsext`).  The
+/// external driver also becomes loadable from `ns/db/drivers`
+/// (`ns_param external nsext.so`).
 pub fn modules() -> ModuleRegistry {
+    nsext::register();
     let mut r = nsd::builtin_modules();
     r.register("nslog", Arc::new(nslog::init));
     r.register("nsperm", Arc::new(nsperm::init));
@@ -23,6 +26,7 @@ pub fn modules() -> ModuleRegistry {
     r.register("nscp", Arc::new(nscp::init));
     r.register("nsdb", Arc::new(nsdb::init));
     r.register("nsproxy", Arc::new(nsproxy::init));
+    r.register("nsext", Arc::new(nsext::init));
     r
 }
 
@@ -182,9 +186,11 @@ mod tests {
         let m = modules();
         for n in [
             "nssock", "nslog", "nsperm", "nscgi", "nsssl", "nszlib", "nscp", "nsdb", "nsproxy",
+            "nsext",
         ] {
             assert!(m.get(n).is_some(), "{n}");
         }
+        assert!(nsdb::driver_factory("nsext").is_some());
         let d = tempfile::tempdir().expect("tmp");
         assert!(install_home(d.path(), false).expect("install") > 10);
         install_perm_files(d.path(), "s1").expect("perm");

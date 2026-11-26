@@ -21,6 +21,7 @@ pub mod adp;
 pub mod callbacks;
 pub mod cmds;
 pub mod conn;
+pub mod content;
 pub mod driver;
 pub mod fastpath;
 pub mod global;
@@ -31,8 +32,11 @@ pub mod module;
 pub mod op;
 pub mod pool;
 pub mod queue;
+pub mod quewait;
 pub mod sched;
 pub mod server;
+pub mod sock;
+pub mod sockcallback;
 pub mod sync;
 pub mod tclcache;
 
@@ -537,6 +541,8 @@ impl Nsd {
             d.wait(left().min(Duration::from_secs(2)));
         }
         g.sched.shutdown(left());
+        g.socks.start_shutdown();
+        g.socks.wait_shutdown(left());
         g.callbacks.run(When::Shutdown);
         if !g.pools.shutdown_all(left()) {
             g.log(

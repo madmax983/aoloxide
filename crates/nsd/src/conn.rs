@@ -24,6 +24,7 @@ use ns_core::request::Request;
 use ns_core::NsSet;
 use tokio::io::AsyncWriteExt;
 
+use crate::content::Content;
 use crate::driver::{DriverInfo, Sock};
 use crate::interp::InterpLease;
 use crate::pool::Limits;
@@ -164,8 +165,9 @@ pub struct Conn {
     pub auth_user: Option<String>,
     /// Basic-auth password.
     pub auth_passwd: Option<String>,
-    /// Request body.
-    pub content: Vec<u8>,
+    /// Request body, in memory or spooled to a temp file.  Released (the
+    /// temp file returned to the pool) when the connection is dropped.
+    pub content: Content,
     /// Read offset into `content` for `ns_conn read`-style consumers.
     pub content_offset: usize,
     /// State flags.
@@ -202,6 +204,8 @@ pub struct Conn {
     pub limits: Option<Arc<Limits>>,
     /// Pool name the request ran in.
     pub pool: String,
+    /// Pre-queue I/O waits (`ns_quewait`).
+    pub que_waits: crate::quewait::QueWaits,
 }
 
 impl std::fmt::Debug for Conn {
@@ -1045,16 +1049,43 @@ impl ConnCtx {
             let c = self.conn();
             let ct = lock_set(&c.headers).iget("content-type").map(str::to_owned);
             let enc = c.query_encoding.or(c.url_encoding);
+            // As `Ns_ConnGetQuery`: content that cannot be mapped parses as
+            // an empty form.
             ns_core::form::parse_form(
                 &c.request.method,
                 c.request.query.as_deref(),
                 ct.as_deref(),
-                &c.content,
+                c.content.bytes().unwrap_or_default(),
                 enc,
             )
         };
         self.conn_mut().form = Some(form.clone());
         form
+    }
+
+    /// The descriptor of a temp file holding the request body
+    /// (`Ns_ConnContentFd`), copying an in-memory body there first.  The
+    /// file belongs to the connection.  Failures are logged.
+    pub fn content_fd(&self) -> io::Result<std::os::unix::io::RawFd> {
+        let r = self.conn_mut().content.fd();
+        self.log_content_error(r)
+    }
+
+    /// A `dup` of [`ConnRef::content_fd`]'s descriptor, sharing its offset
+    /// (for a CGI's standard input).  Failures are logged.
+    pub fn content_file(&self) -> io::Result<std::fs::File> {
+        let r = self.conn_mut().content.dup_fd();
+        self.log_content_error(r)
+    }
+
+    fn log_content_error<T>(&self, r: io::Result<T>) -> io::Result<T> {
+        if let Err(e) = &r {
+            self.server.global.log(
+                Severity::Error,
+                &format!("conn[{}]: could not get fd: {e}", self.id()),
+            );
+        }
+        r
     }
 
     /// Discard the cached form (`ns_conn clearquery`/encoding changes).

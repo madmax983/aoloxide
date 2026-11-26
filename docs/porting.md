@@ -26,6 +26,7 @@ intentional behavioural deviation, and tracks what is not yet ported.
 | `nsd/nsconf.c`, `info.c` | `nsd/src/global.rs`, `cmds/info.rs` |
 | `nsd/server.c` | `nsd/src/server.rs` |
 | `nsd/driver.c`, `nssock/` | `nsd/src/driver.rs` |
+| `nsd/fd.c` (`Ns_GetTemp`), `NsConnContent`, `Ns_ConnContentFd` | `nsd/src/content.rs` |
 | `nsd/queue.c`, `pools.c`, `limits.c` | `nsd/src/queue.rs`, `pool.rs` |
 | `nsd/conn.c`, `connio.c`, `return.c` | `nsd/src/conn.rs`, `cmds/conn.rs` |
 | `nsd/op.c`, `filter.c`, `auth.c` | `nsd/src/op.rs` |
@@ -37,8 +38,13 @@ intentional behavioural deviation, and tracks what is not yet ported.
 | `nsd/tcljob.c` | `nsd/src/job.rs`, `cmds/thread.rs` |
 | `nsd/tclthread.c`, `nsthread/` | `nsd/src/sync.rs`, `cmds/thread.rs` (std threads) |
 | `nsd/tclvar.c` | `nsd/src/cmds/nsv.rs` |
-| `nsd/tclmisc.c`, `tclhttp.c`, `tclxkeylist.c`, `tclloop.c`, `tclenv.c`, `tclimg.c`, `tclsock.c` | `nsd/src/cmds/misc.rs` |
+| `nsd/tclmisc.c`, `tclhttp.c`, `tclxkeylist.c`, `tclloop.c`, `tclenv.c`, `tclimg.c` | `nsd/src/cmds/misc.rs` |
+| `nsd/tclsock.c` | `nsd/src/cmds/sock.rs` (DNS commands in `cmds/misc.rs`) |
+| `nsd/sock.c` | `nsd/src/sock.rs` |
+| `nsd/sockcallback.c`, `listen.c` | `nsd/src/sockcallback.rs` |
+| `Ns_QueueWait`, `RunQueWaits` (`nsd/driver.c`) | `nsd/src/quewait.rs` |
 | `nsd/tclfile.c` | `nsd/src/cmds/file.rs` |
+| `nsd/tclfile.c` (`ns_chan`), `tclshare.c` | `nsd/src/cmds/misc.rs`, `cmds/share.rs`; Tcl channel, trace and async API in `ns-tcl/src/extra.rs` |
 | `nsd/modload.c` | `nsd/src/module.rs` |
 | `nsd/nsmain.c`, `main.c`, `unix.c`, `pidfile.c` | `nsd/src/lib.rs`, `aoloxide/src/main.rs` |
 | `nslog/` | `crates/nslog` |
@@ -49,7 +55,10 @@ intentional behavioural deviation, and tracks what is not yet ported.
 | `nscp/` | `crates/nscp` |
 | `nsdb/` | `crates/nsdb` (`driver.rs`: driver trait + SQLite) |
 | `nsproxy/nsproxylib.c`, `nsproxy.c` | `crates/nsproxy` (`src/bin/nsproxy.rs` is the worker) |
-| `nsd/dstring.c`, `index.c`, `lisp.c`, `str.c`, `dsprintf.c`, `fd.c`, `binder.c` | replaced by the Rust standard library |
+| `nsext/nsext.c` | `crates/nsext` (`conn.rs`: the protocol client, `cmd.rs`: `ns_ext`) |
+| `nsext/msg.c`, `include/nsextmsg.h` | `crates/nspd/src/msg.rs` |
+| `nspd/main.c`, `listen.c`, `log.c`, `include/nspd.h` | `crates/nspd` (`src/bin/nssqlitepd.rs`: an SQLite daemon) |
+| `nsd/dstring.c`, `index.c`, `lisp.c`, `str.c`, `dsprintf.c`, `fd.c` (except temp files), `binder.c` | replaced by the Rust standard library |
 
 ## Intentional deviations
 
@@ -63,9 +72,22 @@ HTTP handling:
 2. **Chunked request bodies** are decoded and **`Expect: 100-continue`** is
    honoured.
 3. **Malformed requests get a status line** (400, 413, 414) before the
-   socket closes; AOLserver mostly dropped them silently.
-4. **Bodies over `maxinput`** are rejected with 413.  There is no temp-file
-   spooling yet (phase 2).
+   socket closes; AOLserver mostly dropped them silently.  This includes a
+   request line and headers that do not end within the driver's
+   `maxinput` (`E_RRANGE`, 400).  As in AOLserver, `maxheader` is read but
+   not used.
+4. **Bodies over the request's `ns_limits` `maxupload`** (default 10 MB)
+   are rejected with 413 before they are read; AOLserver closed the socket
+   without a reply.  As in AOLserver, a body whose request (line, headers,
+   body and a trailing CRLF) reaches the driver's `maxinput` is spooled to
+   an unlinked temp file (`Ns_GetTemp`) instead of memory, and the file
+   returns to the temp-file pool when the connection is done.  A request
+   without a `Content-Length` counts as a 0-byte body there, so its empty
+   body is spooled too when the head alone reaches `maxinput`.  Temp
+   files are created in `/tmp` (`P_tmpdir`, `TMPDIR` is ignored), and
+   `nscgi` gives the CGI the temp file as its standard input.  Chunked
+   bodies (deviation 2) take the same first decision, then spill to a
+   temp file when the next chunk would reach `maxinput`.
 5. **`+` in a URL path is a literal plus.**  AOLserver decoded `+` as a
    space in paths as well as in query strings.
 6. **A request that produced no response gets a 500** (for example a
@@ -90,30 +112,31 @@ Server behaviour:
 
 Script API:
 
-12. `ns_sockopen` returns the same bidirectional Tcl channel twice
-    (`[list $chan $chan]`).
-13. `ns_info threads|locks|callbacks|sockcallbacks` return empty lists, and
+12. `ns_info threads|locks|callbacks` return empty lists, and
     `ns_server active|all|keepalive` report minimal information.
-14. `ns_thread name` reports but cannot rename the current thread.
-15. `ns_http`/`ns_geturl` support plain `http://` only.
+13. `ns_thread name` reports but cannot rename the current thread.
+14. `ns_http`/`ns_geturl` support plain `http://` only.
 
 Modules:
 
-16. `nsssl` is built on rustls and answers to both `nsssl` and
+15. `nsssl` is built on rustls and answers to both `nsssl` and
     `nsopenssl` module names; it accepts PEM `certfile`/`keyfile` only (no
     OpenSSL cipher strings or client-certificate options).
-17. `nsdb` ships a SQLite driver (`sqlite`) in place of AOLserver's
-    external C drivers.  Drivers buffer a query's rows when it runs;
-    `ns_db sp_*` (stored procedures) return a "not supported" error.
-18. `ns_proxy active pool` lists checked-out handles that are evaluating.
+16. `nsdb` ships a SQLite driver (`sqlite`) in place of AOLserver's
+    external C drivers.  The SQLite driver buffers a query's rows when it
+    runs; on drivers without stored procedures (SQLite) `ns_db sp_*`
+    on a connected handle return a "not supported" error (on a
+    disconnected handle they fail with `Database operation "sp_..."
+    failed`, as in AOLserver, whatever the driver).
+17. `ns_proxy active pool` lists checked-out handles that are evaluating.
     AOLserver walked the pool's *free* list, so it always returned an
     empty list.
-19. `nsproxy` workers speak a private length-prefixed protocol (the worker
+18. `nsproxy` workers speak a private length-prefixed protocol (the worker
     binary ships with the server).  Replies are read whole by a reader
     thread, so `-sendtimeout` and `-recvtimeout` are accepted and reported
     but have no effect; `-evaltimeout` and `-waittimeout` behave as in
     AOLserver.
-20. **nscp:** The control port parses input as a byte stream, not per
+19. **nscp:** The control port parses input as a byte stream, not per
     `recv()` chunk as `GetLine` does.  `IAC EOF`, `IAC IP`, a line that
     starts with EOT (Ctrl-D) and end of input (even after a partial line)
     still end the session, and any other telnet command still logs
@@ -126,58 +149,180 @@ Modules:
     client that sent its password at once lost it to that flush.  Each
     line is read up to `\n` (CR and NUL bytes are dropped), so several
     lines arriving in one packet are evaluated one command at a time.
-21. **nszlib:** `ns_zlib uncompress` and `gunzip` decode their result
+20. **nszlib:** `ns_zlib uncompress` and `gunzip` decode their result
     as Tcl 8.6 reads bytes: valid UTF-8 is decoded, `C0 80` is NUL and any
     other invalid byte is its Latin-1 character.  Tcl also decodes
     UTF-8-encoded surrogates (`ED A0 80`) to lone UTF-16 surrogates; script
     strings here cannot hold those, so each such byte is its Latin-1
     character instead.
-22. **nsdb:** A handle reconnected after `ns_db bouncepool` counts as current.
+21. **nsdb:** A handle reconnected after `ns_db bouncepool` counts as current.
     AOLserver never updated a reconnected handle's bounce count, so a
     handle that was in use during a bounce was closed again on every later
     return to the pool.
-23. **nsdb:** `ns_db` subcommands given the wrong number of arguments raise
+22. **nsdb:** `ns_db` subcommands given the wrong number of arguments raise
     the "wrong # args" error.  For the handle subcommands (`select`,
     `releasehandle`, ...) AOLserver set that message but returned `TCL_OK`.
-24. **nsdb:** Deleting an interp returns the handles it still holds to their
+23. **nsdb:** Deleting an interp returns the handles it still holds to their
     pools (AOLserver's `FreeData` dropped them, shrinking the pool).  The
     SQLite driver treats a statement of only whitespace or comments (for
     example between two `;` in `interpretsqlfile`) as an empty DML command,
     and reports errors without a SQLite code as exception `NSDB`.
-25. **nsproxy:** `ns_proxy config` accepts `-gettimeout` as an alias of
+24. **nsproxy:** `ns_proxy config` accepts `-gettimeout` as an alias of
     AOLserver's `-getimeout` (the flag reported back is `-getimeout`).
-26. **nsproxy:** A failed `ns_proxy get` returns its proxies the way
+25. **nsproxy:** A failed `ns_proxy get` returns its proxies the way
     `ns_proxy release` does: a proxy whose return leaves no spare capacity
     (`-max` was lowered while the handles were being checked) is freed
     rather than put on the free list, so idle workers never exceed the
     spare capacity (proved in `verus/proxy.rs`).  AOLserver put them all
     back on the free list.
-27. **nsproxy:** When the ping or `-init` script of a handle being checked
+26. **nsproxy:** When the ping or `-init` script of a handle being checked
     out fails, the proxy is reset to idle with its worker closed.
     AOLserver left a timed-out proxy marked busy, so the replacement
     worker's `-init` (or the caller's first `eval`) failed with `EBusy`.
-28. **nsproxy:** Protocol messages are capped at 256 MiB, and the worker's
+27. **nsproxy:** Protocol messages are capped at 256 MiB, and the worker's
     private protocol descriptors are close-on-exec.  A closing worker is
     reaped by polling for its exit rather than for EOF on its result pipe;
     the `SIGTERM`/`SIGKILL` sequence and its warnings match AOLserver.
+28. **channels:** `ns_chan put` refuses a channel that is registered in more
+    than one interp ("channel is shared"), as `ns_chan create` does;
+    AOLserver cut it from under the other interp.  `ns_chan cleanup` and
+    `ns_chan put` find a channel by name and identity, so one the script
+    already closed is skipped (AOLserver used the stale pointer), and
+    `ns_chan get` of a channel whose name the interp already has fails
+    instead of hitting Tcl's duplicate-name panic, and leaves the channel
+    in the shared table.  `ns_chan put` to a name that was taken again
+    since the `get` overwrites the entry as AOLserver did, but closes the
+    channel it displaces (flushing its output) where AOLserver leaked it
+    (see `verus/chan.rs`).  `ns_chan list` returns names in sorted order.
+29. **channels:** `ns_conn channel` needs a plain TCP connection: on a TLS
+    connection it fails, and `ns_conn sock` returns -1 there (AOLserver
+    handed out the raw, encrypted socket).  A second `ns_conn channel`
+    fails with "bad file number".  The channel wraps a duplicate of the
+    socket descriptor (the original is owned by the async runtime until
+    the channel exists, so a failure leaves the connection its socket),
+    so its `sockN` name need not match the earlier `ns_conn sock`.
+30. **channels:** `ns_ictl threads` reports each thread that created an interp
+    as the number `N` of `ns_thread id`'s `ThreadId(N)`, and `ns_ictl
+    cancel` accepts either form.  When Tcl's event loop runs the cancel
+    handler with no interp it does nothing (AOLserver's `AsyncCancel`
+    dereferenced the NULL interp).
+31. **channels:** `ns_share` raises an error where AOLserver called `Ns_Fatal`
+    (a trace that cannot be set, e.g. `ns_share ::nosuch::x`), and the
+    "can't determine existence of variable" error no longer leaves the
+    share table's critical section held.  Shared arrays are copied into
+    an interp in sorted key order.
+32. **channels:** The `ns_adp_output` variable that `ns_adp_debug` links to the
+    ADP output buffer is always the global one and is refreshed by a
+    variable trace; writing it restores the buffer's value instead of
+    failing with "linked variable is read-only".
 
-## Not yet supported (phase 2)
+33. **sockets:** `ns_quewait` waits are polled in the connection
+    thread, between the pre-queue and read filters, because pre-queue
+    filters run there (item 7); waits may be registered only while
+    pre-queue filters and queue-wait callbacks run (AOLserver: only in the
+    driver thread), otherwise the command fails with "could not register
+    sock wait" and logs "attempt to register quewait outside driver
+    thread".  The timeout is relative to the call.  AOLserver stored the
+    relative time where the driver expected an absolute one, so every wait
+    timed out at once unless its socket was already ready.  As in
+    AOLserver, input from the client while waiting counts as a drop: the
+    callbacks get `dropped` and the connection closes without a response.
+34. **sockets:** Socket descriptors made by the socket commands are
+    close-on-exec, including the duplicates made by `ns_sockopen`,
+    `ns_sockaccept`, listen callbacks and `ns_sockcallback` (AOLserver's
+    `ns_sockdup` left them inheritable).  `ns_sockselect` uses `poll(2)`
+    (no `FD_SETSIZE` limit), reporting what `select(2)` reports: readable
+    includes hang-up and error, writable includes error.  OS errors are
+    the system's `strerror` text in lower case, which can differ in
+    wording from `Tcl_PosixError`.  A Tcl socket callback cancelled or
+    replaced through the C-level API (`SockCallbacks::cancel`, or a new
+    registration for the same descriptor) closes its descriptor and
+    channel; AOLserver leaked them.
+35. **sockets:** `ns_info sockcallbacks` lists the callback thread's table
+    as of its last pass (AOLserver read the table while the thread could
+    change it), so a new registration appears once the thread has woken.
+    The callback thread waits for startup to complete, or for shutdown to
+    begin (AOLserver waited for startup only).
+36. **sockets:** Failures inside the socket callback system that AOLserver
+    treats as fatal (`Ns_Fatal`, which stops the server) are logged
+    instead: a failed `poll()` in the `-socks-` thread is retried after
+    100 ms, and a failed trigger `send()` or `recv()` is logged and the
+    thread carries on.  When the trigger socket pair or the thread cannot
+    be created, the registration fails ("could not register callback"),
+    and registrations other threads queued in the meantime, already
+    accepted, are dropped, closing their descriptors (modelled as
+    `abandon` in `verus/sockcallback.rs`).
 
-These commands exist but return a clear `not supported` error:
-`ns_share`, `ns_chan` (except `cleanup`/`list`), `ns_conn channel|
-contentchannel|sock|interp`, `ns_sockaccept`, `ns_sockselect`,
-`ns_sockcallback`, `ns_socklisten`, `ns_socklistencallback`,
-`ns_socketpair`, `ns_quewait`, `ns_adp_debug`, `ns_adp_ctl channel`,
-`ns_ictl cancel`.
+37. **spooling:** A spooled body is read into memory on its first
+    whole-body use (`ns_conn content` without a range, form parsing), where
+    AOLserver `mmap`ed the temp file; `ns_conn content off len`,
+    `ns_conn copy` and `ns_writecontent` read the file a piece at a time.
+    `ns_conn contentchannel` opens the connection's temp file through
+    `/dev/fd`: on Linux each channel has its own file offset starting at
+    the beginning of the content, where AOLserver's `dup()` shared one
+    offset, so a second channel opened after reading the first started at
+    end of file.
+38. **spooling:** A body refused for `maxupload` counts in the limits'
+    `ndropped` (`ns_limits get`), which AOLserver never incremented.  A
+    temp file that cannot be created or written is always logged as an
+    error (AOLserver logged it only with the driver's `debug` on); in
+    both, the socket is closed without a reply and no driver statistic
+    changes.
+39. **nsext:** Driver modules are compiled in and registered with
+    `nsdb::register_driver`; `ns_param external nsext.so` in
+    `ns/db/drivers` loads `nsext` from `ns/db/driver/external` as
+    `Ns_DbDriverInit` did, when a pool first names the driver
+    (`NsDbLoadDriver`); an entry no pool uses is never initialised.  A
+    driver whose config is unusable is still registered (as in
+    AOLserver) and its handles fail to open.
+40. **nsext:** Replies are read through a buffer instead of being peeked
+    (`MSG_PEEK`) and then read, so a reply line split across packets is
+    no longer a protocol error.  Lines must still fit AOLserver's buffers
+    (4096 bytes for a status, 32768 for a response, 256 for an `exec`
+    reply, 32 for a list element's size).  An element size below `-1`
+    is a protocol error (AOLserver used it as a length).  Exception codes
+    are kept whole (AOLserver copied them into a 6-byte buffer), and an
+    `ok` status does not clear the handle's exception message (every
+    `ns_db` command clears the exception before it runs).
+41. **nsext:** `spgetparams` reads the values list even when the names
+    list is empty.  AOLserver stopped after an empty names list, leaving
+    the values unread and the next reply out of step (the reply shapes
+    are proved to agree in `verus/extproto.rs`).
+42. **nsext:** `ns_ext cpto` and `cpfrom` report a failed copy even when
+    the remote file then closes cleanly.  AOLserver returned the status
+    of the final `closefile`, so a failed write could report success.
+43. **nsext:** `ns_ext` on a handle whose daemon connection was dropped
+    after an error raises `handle "nsdbN" is not connected` (AOLserver
+    dereferenced the freed connection).
+44. **nspd:** The daemon library serves each accepted connection on a
+    thread of one process; AOLserver forked a process per connection.
+    Tracing and open remote files belong to each connection.  Requests
+    are read through a buffer (a header split across reads is not an
+    error; a negative argument length ends the session, as a too-long
+    one does).  `closefile`, `readfile` and `writefile` only accept
+    descriptors that `openfile` returned on the same connection
+    (AOLserver used any descriptor number, the daemon's own sockets
+    included), `readfile` returns at most 4096 bytes (AOLserver
+    overflowed its 4096-byte buffer), and a `writefile` with fewer data
+    bytes than its count fails.  Newlines in reply lines become spaces.
+45. **nspd:** `nssqlitepd` serves SQLite through nsdb's SQLite driver: it
+    identifies as `SQLite Proxy Daemon v4.5`, `setmaxrows` limits the
+    rows of later queries, `resultid` is empty and stored procedures
+    fail with exception `NSPD`.  The datasource is the database file; as
+    in AOLserver the daemon changes to `/`, so it should be absolute.
 
-Modules still to port:
+## Completeness
 
-| Module | Plan |
-|---|---|
-| `nsext`, `nspd` | external database proxy protocol, as an `nsdb` driver |
+Every AOLserver 4.5 module and `ns_*` command is ported; none returns a
+"not supported" error.  What remains different is listed under
+"Intentional deviations" above.  Two gaps, both inherited from
+AOLserver itself:
 
-Also planned: spooling large uploads to temp files, `ns_sockcallback` on
-the tokio runtime, and channel transfer for `ns_chan`.
+* `ns_db sp_*` (stored procedures) is not implemented by the SQLite
+  driver or `nssqlitepd`; other `nsdb` drivers can implement it.
+* `nsext` does not implement the `gettableinfo`, `tablelist` and
+  `bestrowid` messages: AOLserver's never sent them, and `nspd` never
+  answered them.
 
 ## Formal verification
 
@@ -189,7 +334,11 @@ the tokio runtime, and channel transfer for `ns_chan`.
 | `glob.rs` | an executable `*`/`?` matcher equals the recursive spec; literal and `*` lemmas |
 | `pool.rs` | pool transitions keep `idle ≤ current ≤ max`; enqueue never strands work while there is capacity |
 | `cache.rs` | inserts keep total size ≤ max; eviction removes only LRU entries |
+| `chan.rs` | `ns_chan` ownership: a channel is registered in some interp, held by the server's shared table, or closed, never two of these; `create`/`put` cut only an unshared channel, `get` gives it to exactly one interp |
+| `spool.rs` | request-body read-ahead: `mem + disk = read ≤ len ≤ maxupload`, one sink only (a spooled body buffers nothing, an in-memory request stays under `maxinput`), receives never over-read; chunked bodies spill without losing bytes |
+| `extproto.rs` | the nsext/nspd protocol: for every message nsext sends, the daemon's reply has the number of items nsext reads (on `ok` and on error); the connection returns to `Ready` after exactly one reply, never sends while a reply is outstanding, and stays `Dead` after an I/O or framing error; unanswered messages are never sent; list elements are read only for sizes within `maxElementSize` and a list ends only at `-1`.  nsext tracks the unread items of each reply from `Msg::reply` (the model's table) and drops a connection that falls out of step; the daemon is tested against the same table for every message |
 | `proxy.rs` | nsproxy handle accounting (`avail + out = max`, idle workers ≤ spare capacity under any interleaving of get, release and config, including a config between a failed `get`'s pops and its give-back; a failed `get` restores the pool) and the `Idle → Busy → Done → Idle` proxy state machine |
+| `sockcallback.rs` | socket callback registry accounting (`queued + active + done + released = accepted`, nothing held once stopped), registrations refused once shutdown is pending so `stop` releases every callback, removal of entries awaiting the sweep, dropping the queue when the thread cannot start, and the `Queued → Active → Done → Released` callback life cycle: never called after returning false or being released |
 
 The production implementations are additionally checked against the same
 specifications by property tests (`proptest`).

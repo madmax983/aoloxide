@@ -20,16 +20,22 @@
 //! * Panics inside commands are caught and turned into Tcl errors; they never
 //!   unwind across the C boundary.
 
+mod extra;
 mod ffi;
 
-use std::cell::Cell;
-use std::ffi::CString;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Once;
 
-use ns_script::{Code, Command, Exception, Extensions, Interp, ScriptEngine, ScriptResult};
+use ns_script::{
+    close_fd, Canceller, Code, Command, DetachedChannel, Exception, Extensions, Interp,
+    ScriptEngine, ScriptResult, TraceOps, VarTrace,
+};
+use std::sync::Arc;
 
 static INIT: Once = Once::new();
 const FILE: &[u8] = b"ns-tcl\0";
@@ -102,6 +108,45 @@ fn cstring(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap_or_default()
 }
 
+thread_local! {
+    /// Channels held by this thread rather than by an interp
+    /// (`Tcl_RegisterChannel(NULL, chan)`), by name.
+    static HELD: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());
+}
+
+/// The name of a live channel.
+///
+/// # Safety
+/// `chan` must be a live channel.
+unsafe fn channel_name(chan: ffi::Tcl_Channel) -> String {
+    // SAFETY: Tcl returns a NUL-terminated name owned by the live channel.
+    unsafe {
+        let p = ffi::Tcl_GetChannelName(chan);
+        if p.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// Wrap socket `fd` in a TCP client channel in binary mode, closing `fd`
+/// if Tcl cannot.
+fn make_socket_channel(interp: *mut ffi::Tcl_Interp, fd: i32) -> Option<ffi::Tcl_Channel> {
+    // SAFETY: Tcl takes ownership of the descriptor, passed by value as
+    // the channel's client data (as `Tcl_MakeTcpClientChannel` expects).
+    let chan = unsafe { ffi::Tcl_MakeTcpClientChannel(fd as isize as ffi::ClientData) };
+    if chan.is_null() {
+        close_fd(fd);
+        return None;
+    }
+    // SAFETY: chan is live; the option strings are NUL-terminated.
+    unsafe {
+        ffi::Tcl_SetChannelOption(interp, chan, c"-translation".as_ptr(), c"binary".as_ptr());
+    }
+    Some(chan)
+}
+
 /// The Tcl engine.  Cheap to share; interps are created per thread.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TclEngine;
@@ -152,8 +197,37 @@ impl ScriptEngine for TclEngine {
     }
 
     fn finalize_thread(&self) {
+        HELD.with(|h| h.borrow_mut().clear());
+        extra::release_thread_canceller();
         // SAFETY: called by a thread that is done with all its interps.
         unsafe { ffi::Tcl_FinalizeThread() };
+    }
+
+    fn thread_canceller(&self) -> Option<Arc<dyn Canceller>> {
+        extra::thread_canceller()
+    }
+
+    fn hold_socket(&self, fd: i32) -> Result<String, Exception> {
+        init_library();
+        let chan = make_socket_channel(ptr::null_mut(), fd)
+            .ok_or_else(|| Exception::error(format!("could not make channel for sock: {fd}")))?;
+        // SAFETY: chan is live; a NULL interp registers a thread-level
+        // reference that keeps the channel open.
+        unsafe { ffi::Tcl_RegisterChannel(ptr::null_mut(), chan) };
+        // SAFETY: chan is live.
+        let name = unsafe { channel_name(chan) };
+        HELD.with(|h| h.borrow_mut().insert(name.clone(), chan as usize));
+        Ok(name)
+    }
+
+    fn release_held(&self, chan: &str) -> bool {
+        let Some(c) = HELD.with(|h| h.borrow_mut().remove(chan)) else {
+            return false;
+        };
+        // SAFETY: the held reference kept the channel alive until now; this
+        // drops it (closing the channel unless an interp still has it).
+        unsafe { ffi::Tcl_UnregisterChannel(ptr::null_mut(), c as ffi::Tcl_Channel) };
+        true
     }
 }
 
@@ -295,6 +369,21 @@ impl TclInterp {
         } else {
             Ok(())
         }
+    }
+
+    /// `Tcl_GetChannel`: the channel and its open mode.
+    fn get_channel(&self, name: &str) -> Result<(ffi::Tcl_Channel, c_int), Exception> {
+        let n = cstring(name);
+        let mut mode: c_int = 0;
+        // SAFETY: raw live, n valid, mode a live local.
+        let chan = unsafe { ffi::Tcl_GetChannel(self.raw, n.as_ptr(), &raw mut mode) };
+        if chan.is_null() {
+            let msg = self.result();
+            // SAFETY: raw is live.
+            unsafe { ffi::Tcl_ResetResult(self.raw) };
+            return Err(Exception::error(msg));
+        }
+        Ok((chan, mode))
     }
 
     fn get_var_flags(&self, name: &str, flags: c_int) -> Option<String> {
@@ -452,6 +541,149 @@ impl Interp for TclInterp {
 
     fn marked_for_delete(&self) -> bool {
         self.delete.get()
+    }
+
+    fn handle(&self) -> usize {
+        self.raw as usize
+    }
+
+    fn invoke_async(&self) {
+        self.invoke_async_impl();
+    }
+
+    fn get_var2(&self, part1: &str, part2: Option<&str>) -> Option<String> {
+        let a = cstring(part1);
+        let k = part2.map(cstring);
+        // SAFETY: raw live; a/k valid for the call.
+        let obj = unsafe {
+            ffi::Tcl_GetVar2Ex(
+                self.raw,
+                a.as_ptr(),
+                k.as_ref().map_or(ptr::null(), |k| k.as_ptr()),
+                0,
+            )
+        };
+        // SAFETY: obj, when non-null, is live.
+        (!obj.is_null()).then(|| unsafe { obj_string(obj) })
+    }
+
+    fn set_var2(&self, part1: &str, part2: Option<&str>, value: &str) -> Result<(), Exception> {
+        let a = cstring(part1);
+        let k = part2.map(cstring);
+        // SAFETY: raw live; a/k valid; Tcl references the value object.
+        let r = unsafe {
+            ffi::Tcl_SetVar2Ex(
+                self.raw,
+                a.as_ptr(),
+                k.as_ref().map_or(ptr::null(), |k| k.as_ptr()),
+                new_obj(value),
+                ffi::TCL_LEAVE_ERR_MSG,
+            )
+        };
+        if r.is_null() {
+            Err(Exception::error(self.result()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn trace_var(
+        &self,
+        name: &str,
+        ops: TraceOps,
+        key: usize,
+        cb: VarTrace,
+    ) -> Result<(), Exception> {
+        self.trace_var_impl(name, ops, key, cb)
+    }
+
+    fn var_trace_keys(&self, name: &str) -> Vec<usize> {
+        self.var_trace_keys_impl(name)
+    }
+
+    fn channel_id(&self, name: &str) -> Result<usize, Exception> {
+        self.channel_id_impl(name)
+    }
+
+    fn channel_is_shared(&self, name: &str) -> Result<bool, Exception> {
+        self.channel_is_shared_impl(name)
+    }
+
+    fn channel_check_mode(&self, name: &str, write: bool) -> Result<(), Exception> {
+        self.channel_check_mode_impl(name, write)
+    }
+
+    fn channel_detach(&self, name: &str) -> Result<DetachedChannel, Exception> {
+        self.channel_detach_impl(name)
+    }
+
+    fn channel_attach(&self, chan: DetachedChannel) -> Result<String, Exception> {
+        self.channel_attach_impl(chan)
+    }
+
+    fn channel_unregister(&self, name: &str, id: usize) {
+        self.channel_unregister_impl(name, id);
+    }
+
+    fn channel_close_detached(&self, chan: DetachedChannel) {
+        Self::channel_close_detached_impl(chan);
+    }
+
+    fn channel_write(&self, name: &str, data: &[u8]) -> Result<(), Exception> {
+        self.channel_write_impl(name, data)
+    }
+
+    fn channel_from_tcp(&self, stream: std::net::TcpStream) -> Result<String, Exception> {
+        self.channel_from_tcp_impl(stream)
+    }
+
+    fn channel_fd(&self, chan: &str, write: bool) -> Result<i32, Exception> {
+        let (c, mode) = self.get_channel(chan)?;
+        let dir = if write {
+            ffi::TCL_WRITABLE
+        } else {
+            ffi::TCL_READABLE
+        };
+        if mode & dir == 0 {
+            return Err(Exception::error(format!(
+                "channel \"{chan}\" not open for {}",
+                if write { "write" } else { "read" }
+            )));
+        }
+        let mut data: ffi::ClientData = ptr::null_mut();
+        // SAFETY: c is live; data is a live out-pointer.
+        if unsafe { ffi::Tcl_GetChannelHandle(c, dir, &raw mut data) } != ffi::TCL_OK {
+            return Err(Exception::error(format!(
+                "could not get handle for channel: {chan}"
+            )));
+        }
+        Ok(data as isize as i32)
+    }
+
+    fn channel_buffered(&self, chan: &str) -> Result<usize, Exception> {
+        let (c, _) = self.get_channel(chan)?;
+        // SAFETY: c is live.
+        let n = unsafe { ffi::Tcl_InputBuffered(c) };
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    fn socket_channel(&self, fd: i32) -> ScriptResult {
+        let chan = make_socket_channel(self.raw, fd)
+            .ok_or_else(|| Exception::error("could not open socket"))?;
+        // SAFETY: raw and chan are live; the interp takes a reference.
+        unsafe { ffi::Tcl_RegisterChannel(self.raw, chan) };
+        // SAFETY: chan is live.
+        Ok(unsafe { channel_name(chan) })
+    }
+
+    fn attach_held_channel(&self, chan: &str) -> Result<(), Exception> {
+        let c = HELD
+            .with(|h| h.borrow().get(chan).copied())
+            .ok_or_else(|| Exception::error(format!("can not find channel named \"{chan}\"")))?;
+        // SAFETY: the thread's hold keeps c alive; registering a channel
+        // already registered in this interp is a no-op.
+        unsafe { ffi::Tcl_RegisterChannel(self.raw, c as ffi::Tcl_Channel) };
+        Ok(())
     }
 }
 
@@ -615,5 +847,48 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, vec!["1", "2", "3", "4"]);
+    }
+
+    #[test]
+    fn socket_and_held_channels() {
+        use std::os::fd::IntoRawFd;
+        let e = TclEngine::new();
+        let i = interp();
+        let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let (fa, fb) = (a.into_raw_fd(), b.into_raw_fd());
+        let ca = i.socket_channel(fa).expect("channel");
+        assert_eq!(i.channel_fd(&ca, true), Ok(fa));
+        assert_eq!(i.channel_fd(&ca, false), Ok(fa));
+        assert_eq!(
+            i.eval_words(&["fconfigure", &ca, "-translation"]),
+            Ok("lf lf".into())
+        );
+        let e1 = i.channel_fd("nosuch", false).expect_err("missing");
+        assert_eq!(e1.message, "can not find channel named \"nosuch\"");
+        assert!(i.channel_buffered("nosuch").is_err());
+        let f = i.eval("open [info nameofexecutable]").expect("open");
+        let e2 = i.channel_fd(&f, true).expect_err("read-only");
+        assert_eq!(e2.message, format!("channel \"{f}\" not open for write"));
+        i.eval_words(&["close", &f]).expect("close");
+        // A held channel outlives the interps it is attached to.
+        let h = e.hold_socket(fb).expect("hold");
+        i.attach_held_channel(&h).expect("attach");
+        i.attach_held_channel(&h).expect("attach twice is a no-op");
+        i.eval(&format!("puts {ca} one; puts {ca} two; flush {ca}"))
+            .expect("write");
+        assert_eq!(i.eval_words(&["gets", &h]), Ok("one".into()));
+        assert_eq!(i.channel_buffered(&h), Ok(4));
+        i.eval_words(&["close", &h]).expect("detach");
+        assert!(i.channel_fd(&h, false).is_err(), "detached from the interp");
+        let j = interp();
+        j.attach_held_channel(&h).expect("attach to another interp");
+        assert_eq!(j.eval_words(&["gets", &h]), Ok("two".into()));
+        drop(j);
+        assert!(e.release_held(&h));
+        assert!(!e.release_held(&h));
+        assert!(i.attach_held_channel(&h).is_err());
+        // Releasing closed the socket: the peer sees end of file.
+        assert_eq!(i.eval_words(&["read", &ca]), Ok(String::new()));
+        i.eval_words(&["close", &ca]).expect("close");
     }
 }

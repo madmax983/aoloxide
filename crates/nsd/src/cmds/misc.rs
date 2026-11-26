@@ -1,7 +1,8 @@
 //! Miscellaneous commands: logging, time, encoding, HTML helpers, keyed
-//! lists, loops, environment, HTTP client, sockets and channels
+//! lists, loops, environment, HTTP client, DNS and channels
 //! (`nsd/tclmisc.c`, `tclhttp.c`, `tclxkeylist.c`, `tclloop.c`, `tclenv.c`,
-//! `tclsock.c`, `tclimg.c`).
+//! `tclimg.c`, and the DNS commands of `tclsock.c`).  The socket commands
+//! are in [`super::sock`].
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -66,30 +67,11 @@ pub fn commands() -> Vec<(&'static str, Command)> {
         ("keylkeys", cmd(keylkeys)),
         ("ns_geturl", cmd(ns_geturl)),
         ("ns_http", cmd(ns_http)),
-        ("ns_sockopen", cmd(ns_sockopen)),
-        ("ns_sockblocking", cmd(|i, a| sock_blocking(i, a, true))),
-        ("ns_socknonblocking", cmd(|i, a| sock_blocking(i, a, false))),
-        ("ns_socknread", cmd(ns_socknread)),
-        ("ns_sockcheck", cmd(ns_sockcheck)),
-        ("ns_socklisten", cmd(ns_socklisten)),
-        ("ns_sockaccept", cmd(unsupported)),
-        ("ns_sockselect", cmd(unsupported)),
-        ("ns_sockcallback", cmd(unsupported)),
-        ("ns_socklistencallback", cmd(unsupported)),
-        ("ns_socketpair", cmd(unsupported)),
         ("ns_chan", cmd(ns_chan)),
-        ("ns_share", cmd(unsupported)),
-        ("ns_quewait", cmd(unsupported)),
+        ("ns_share", cmd(super::share::ns_share)),
         ("ns_checkurl", cmd(ns_checkurl)),
         ("ns_puts", cmd(super::adp::ns_adp_puts)),
     ]
-}
-
-fn unsupported(_interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    Err(Exception::error(format!(
-        "{}: not supported in this release of aoloxide",
-        argv.first().map_or("", String::as_str)
-    )))
 }
 
 fn ns_log(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
@@ -1042,74 +1024,135 @@ fn ns_http(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
     }
 }
 
-// ---- sockets & channels (via the engine's own socket channels) ----
+// ---- channels ----
 
-fn ns_sockopen(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    let mut a: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-    let nonblock = a.first() == Some(&"-nonblock");
-    if nonblock {
-        a.remove(0);
+/// `ns_chan cleanup|list|create|put|get` (`NsTclChanObjCmd`): move
+/// channels between interps and threads through the server's shared
+/// table.  See `verus/chan.rs` for the ownership invariant.
+fn ns_chan(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
+    if argv.len() < 2 {
+        return Err(wrong_args(argv, 1, "command ?args?"));
     }
-    let mut timeout = None;
-    if a.first() == Some(&"-timeout") && a.len() > 1 {
-        timeout = Some(a[1].to_owned());
-        a.drain(..2);
-    }
-    if a.len() != 2 {
-        return Err(wrong_args(
-            argv,
-            1,
-            "?-nonblock|-timeout seconds? host port",
-        ));
-    }
-    let _ = timeout;
-    let mut words = vec!["socket"];
-    if nonblock {
-        words.push("-async");
-    }
-    words.push(a[0]);
-    words.push(a[1]);
-    let chan = interp.eval_words(&words)?;
-    Ok(interp.list_join(&[&chan, &chan]))
-}
-
-fn sock_blocking(interp: &dyn Interp, argv: &[String], blocking: bool) -> ScriptResult {
-    check_args(argv, 2, 2, 1, "sockId")?;
-    interp.eval_words(&[
-        "fconfigure",
-        &argv[1],
-        "-blocking",
-        if blocking { "1" } else { "0" },
-    ])?;
-    Ok(String::new())
-}
-
-fn ns_socknread(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    check_args(argv, 2, 2, 1, "sockId")?;
-    interp.eval_words(&["chan", "pending", "input", &argv[1]])
-}
-
-fn ns_sockcheck(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    check_args(argv, 2, 2, 1, "sockId")?;
-    let err = interp.eval_words(&["fconfigure", &argv[1], "-error"])?;
-    Ok(bool_str(err.is_empty()))
-}
-
-fn ns_socklisten(interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    check_args(argv, 3, 3, 1, "address port")?;
-    let _ = interp;
-    Err(Exception::error(
-        "ns_socklisten: use the engine's [socket -server] with a callback; blocking listen sockets are not supported",
-    ))
-}
-
-fn ns_chan(_interp: &dyn Interp, argv: &[String]) -> ScriptResult {
-    let (_, opt) = super::subcommand(argv, &["cleanup", "create", "get", "list", "put"])?;
+    let opts = ["cleanup", "list", "create", "put", "get"];
+    let opt = opts[ns_script::get_index(&argv[1], &opts, "option")?];
+    let srv = server(interp)?;
+    let st = crate::interp::ns_interp(interp)?;
+    let lock_chans = || srv.chans.lock().unwrap_or_else(PoisonError::into_inner);
     match opt {
-        "cleanup" | "list" => Ok(String::new()),
-        _ => Err(Exception::error(format!(
-            "ns_chan {opt}: sharing channels between interps is not supported"
-        ))),
+        "create" => {
+            if argv.len() != 4 {
+                return Err(wrong_args(argv, 1, "create channel name"));
+            }
+            if interp.channel_is_shared(&argv[2])? {
+                return Err(Exception::error("channel is shared"));
+            }
+            let mut table = lock_chans();
+            if table.contains_key(&argv[3]) {
+                return Err(Exception::error(format!(
+                    "channel with name \"{}\" already exists",
+                    argv[3]
+                )));
+            }
+            let det = interp.channel_detach(&argv[2])?;
+            table.insert(argv[3].clone(), det);
+            Ok(String::new())
+        }
+        "get" => {
+            if argv.len() != 3 {
+                return Err(wrong_args(argv, 1, "get name"));
+            }
+            let name = &argv[2];
+            let det = {
+                let mut table = lock_chans();
+                let det = table
+                    .get(name)
+                    .ok_or_else(|| Exception::error(format!("no such shared channel: {name}")))?;
+                // Refuse, leaving the channel in the table, what the splice
+                // could not do (AOLserver hit Tcl's duplicate-name panic).
+                if det.engine() != interp.engine() {
+                    return Err(Exception::error(format!(
+                        "channel \"{}\" belongs to the {} engine",
+                        det.name(),
+                        det.engine()
+                    )));
+                }
+                if interp.channel_id(det.name()).is_ok() {
+                    return Err(Exception::error(format!(
+                        "channel \"{}\" already exists in this interp",
+                        det.name()
+                    )));
+                }
+                table
+                    .remove(name)
+                    .ok_or_else(|| Exception::error(format!("no such shared channel: {name}")))?
+            };
+            let id = det.id();
+            let cname = interp.channel_attach(det)?;
+            st.borrow_mut().chans.insert(
+                name.clone(),
+                crate::interp::RegChan {
+                    name: cname.clone(),
+                    id,
+                },
+            );
+            Ok(cname)
+        }
+        "put" => {
+            if argv.len() != 3 {
+                return Err(wrong_args(argv, 1, "put name"));
+            }
+            let name = &argv[2];
+            let reg = st
+                .borrow()
+                .chans
+                .get(name)
+                .cloned()
+                .ok_or_else(|| Exception::error(format!("no such shared channel: {name}")))?;
+            if interp.channel_id(&reg.name).ok() != Some(reg.id) {
+                st.borrow_mut().chans.remove(name);
+                return Err(Exception::error("channel mismatch"));
+            }
+            // Deviation: a channel registered in another interp too (e.g.
+            // with `interp share`) is not cut from under it.
+            if interp.channel_is_shared(&reg.name)? {
+                return Err(Exception::error("channel is shared"));
+            }
+            let det = interp.channel_detach(&reg.name)?;
+            st.borrow_mut().chans.remove(name);
+            // As in AOLserver the entry is overwritten, but the channel it
+            // displaces is closed rather than leaked.
+            let displaced = lock_chans().insert(name.clone(), det);
+            if let Some(old) = displaced {
+                interp.channel_close_detached(old);
+            }
+            Ok(String::new())
+        }
+        _ => {
+            if argv.len() != 2 && argv.len() != 3 {
+                return Err(wrong_args(argv, 1, &format!("{opt} ?-shared?")));
+            }
+            let shared = argv.len() == 3;
+            if opt == "list" {
+                let names: Vec<String> = if shared {
+                    lock_chans().keys().cloned().collect()
+                } else {
+                    st.borrow().chans.keys().cloned().collect()
+                };
+                return Ok(interp.list_from(&names));
+            }
+            if shared {
+                let all = std::mem::take(&mut *lock_chans());
+                for det in all.into_values() {
+                    interp.channel_close_detached(det);
+                }
+            } else {
+                let all = std::mem::take(&mut st.borrow_mut().chans);
+                for reg in all.into_values() {
+                    interp.channel_unregister(&reg.name, reg.id);
+                }
+            }
+            Ok(String::new())
+        }
     }
 }
 

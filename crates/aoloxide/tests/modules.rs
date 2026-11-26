@@ -170,8 +170,20 @@ fn nscgi_runs_scripts() {
     )
     .unwrap();
     std::fs::set_permissions(&redirect, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // What the CGI's standard input is, and how much it holds.
+    let stdin = cgi_dir.path().join("stdin.sh");
+    std::fs::write(
+        &stdin,
+        "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n'\n\
+         if [ -p /dev/stdin ]; then t=pipe; elif [ -f /dev/stdin ]; then t=file; \
+         elif [ -c /dev/stdin ]; then t=char; else t=other; fi\n\
+         echo \"$t $(wc -c | tr -d ' ')\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&stdin, std::fs::Permissions::from_mode(0o755)).unwrap();
     let extra = format!(
-        "ns_section ns/server/s1/module/nscgi\nns_param map \"GET /cgi-bin {d}\"\nns_param map \"POST /cgi-bin {d}\"",
+        "ns_section ns/server/s1/module/nscgi\nns_param map \"GET /cgi-bin {d}\"\nns_param map \"POST /cgi-bin {d}\"\n\
+         ns_section ns/server/s1/module/nssock\nns_param maxinput 4096",
         d = cgi_dir.path().display()
     );
     let srv = boot("ns_param nscgi nscgi.so", &extra, |_| {});
@@ -185,6 +197,20 @@ fn nscgi_runs_scripts() {
     );
     assert!(r.contains("method=POST"));
     assert!(r.trim_end().ends_with("hello"), "{r}");
+    // As `Ns_ConnContentFd`: the body is the temp file (spooled or copied
+    // there), never a pipe; no body is /dev/null.
+    for n in [5, 100_000] {
+        let r = request(
+            srv.port,
+            &format!(
+                "POST /cgi-bin/stdin.sh HTTP/1.0\r\nContent-Length: {n}\r\n\r\n{}",
+                "z".repeat(n)
+            ),
+        );
+        assert!(r.trim_end().ends_with(&format!("file {n}")), "{r}");
+    }
+    let r = request(srv.port, "GET /cgi-bin/stdin.sh HTTP/1.0\r\n\r\n");
+    assert!(r.trim_end().ends_with("char 0"), "{r}");
     let r = request(srv.port, "GET /cgi-bin/redir.sh HTTP/1.0\r\n\r\n");
     assert_eq!(status(&r), 302);
     assert!(r.contains("/elsewhere"));
@@ -553,10 +579,11 @@ fn nsdb_handle_subcommands_and_misconfig() {
     .unwrap();
     std::fs::write(dir.path().join("x.csv"), " a , b ,\"c \",\n\n").unwrap();
     let extra = format!(
-        "ns_section ns/db/drivers\nns_param sqlite nssqlite.so\nns_param bogus nsbogus.so\n\
-         ns_section ns/db/pools\nns_param one One\nns_param nodrv x\nns_param baddrv x\nns_param nods x\nns_param hidden H\n\
+        "ns_section ns/db/drivers\nns_param sqlite nssqlite.so\nns_param bogus nsbogus.so\nns_param unloaded nsunloaded.so\n\
+         ns_section ns/db/pools\nns_param one One\nns_param bogusdrv x\nns_param nodrv x\nns_param baddrv x\nns_param nods x\nns_param hidden H\n\
          ns_section ns/db/pool/one\nns_param driver sqlite\nns_param datasource {db}\nns_param connections 1\n\
          ns_param user scott\nns_param password tiger\nns_param verbose on\nns_param logsqlerrors on\n\
+         ns_section ns/db/pool/bogusdrv\nns_param driver bogus\nns_param datasource x\n\
          ns_section ns/db/pool/nodrv\nns_param datasource x\n\
          ns_section ns/db/pool/baddrv\nns_param driver nosuch\nns_param datasource x\n\
          ns_section ns/db/pool/nods\nns_param driver sqlite\n\
@@ -791,6 +818,8 @@ proc dbx_proc {} {
     ] {
         assert!(log.contains(want), "missing {want:?} in {log}");
     }
+    // A driver no pool names is never loaded.
+    assert!(!log.contains("unloaded"), "{log}");
 }
 
 #[test]
@@ -817,4 +846,74 @@ fn nsdb_pools_belong_to_each_server_instance() {
         assert_eq!(r.split("\r\n\r\n").nth(1), Some(want.as_str()), "{r}");
         drop(srv);
     }
+}
+
+#[test]
+fn nsext_pool_with_a_local_daemon() {
+    // The SQLite proxy daemon lives in the target profile dir, like the
+    // nsproxy worker (`cargo test --workspace` builds it).
+    let exe = std::env::current_exe().unwrap();
+    let daemon = exe
+        .ancestors()
+        .map(|d| d.join("nssqlitepd"))
+        .find(|p| p.is_file())
+        .expect("nssqlitepd binary: run `cargo build -p nspd` first");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ext.sqlite");
+    // A relative LocalDaemon is found in the home's bin directory.
+    let extra = format!(
+        "ns_section ns/db/drivers\nns_param external nsext.so\n\
+         ns_section ns/db/driver/external\nns_param LocalDaemon nssqlitepd\nns_param Timeout 20\n\
+         ns_section ns/db/pools\nns_param ext \"External DB\"\n\
+         ns_section ns/db/pool/ext\nns_param driver external\nns_param datasource {}\nns_param connections 2\n\
+         ns_section ns/server/s1/db\nns_param pools *\nns_param defaultpool ext",
+        db.display()
+    );
+    let srv = boot("ns_param nsdb nsdb.so", &extra, |h| {
+        std::fs::create_dir_all(h.join("bin")).unwrap();
+        std::fs::copy(&daemon, h.join("bin/nssqlitepd")).unwrap();
+        let lib = h.join("servers/s1/modules/tcl");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            lib.join("ext.tcl"),
+            r#"
+ns_register_proc GET /ext ext_proc
+proc ext_proc {} {
+    set db [ns_db gethandle]
+    ns_db dml $db "create table if not exists t (id integer, name text)"
+    ns_db dml $db "insert into t values (1, 'one')"
+    set out {}
+    set row [ns_db select $db "select id, name from t order by id limit 1"]
+    while {[ns_db getrow $db $row]} {
+        lappend out "[ns_set get $row id]=[ns_set get $row name]"
+    }
+    lappend out [ns_db driver $db] [ns_db dbtype $db] [ns_ext isremote $db] [ns_ext ping $db]
+    lappend out [ns_set get [ns_db 1row $db "select count(*) as n from t"] n]
+    ns_db releasehandle $db
+    ns_return 200 text/plain $out
+}
+"#,
+        )
+        .unwrap();
+    });
+    for n in 1..=2 {
+        let r = request(srv.port, "GET /ext HTTP/1.0\r\n\r\n");
+        let body = r.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert_eq!(
+            body,
+            format!("1=one External SQLite 0 ok {n}"),
+            "{r} {:?}",
+            srv.nsd.global.log.captured()
+        );
+    }
+    // Both requests used the same daemon connection.
+    let opened = srv
+        .nsd
+        .global
+        .log
+        .captured()
+        .iter()
+        .filter(|l| l.contains("nsext: datasource opened:"))
+        .count();
+    assert_eq!(opened, 1);
 }

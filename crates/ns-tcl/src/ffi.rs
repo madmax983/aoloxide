@@ -21,16 +21,37 @@ pub struct Tcl_Obj {
 }
 
 pub type Tcl_Command = *mut c_void;
+/// Opaque `Tcl_Channel`.
+pub type Tcl_Channel = *mut c_void;
 pub type ClientData = *mut c_void;
 pub type Tcl_ObjCmdProc =
     unsafe extern "C" fn(ClientData, *mut Tcl_Interp, c_int, *const *mut Tcl_Obj) -> c_int;
 pub type Tcl_CmdDeleteProc = unsafe extern "C" fn(ClientData);
+
+/// Opaque `Tcl_AsyncHandler`.
+pub type Tcl_AsyncHandler = *mut c_void;
+pub type Tcl_AsyncProc = unsafe extern "C" fn(ClientData, *mut Tcl_Interp, c_int) -> c_int;
+pub type Tcl_VarTraceProc = unsafe extern "C" fn(
+    ClientData,
+    *mut Tcl_Interp,
+    *const c_char,
+    *const c_char,
+    c_int,
+) -> *mut c_char;
 
 pub const TCL_OK: c_int = 0;
 pub const TCL_ERROR: c_int = 1;
 pub const TCL_GLOBAL_ONLY: c_int = 1;
 pub const TCL_LEAVE_ERR_MSG: c_int = 0x200;
 pub const TCL_EVAL_GLOBAL: c_int = 0x20000;
+pub const TCL_READABLE: c_int = 1 << 1;
+pub const TCL_WRITABLE: c_int = 1 << 2;
+pub const TCL_TRACE_READS: c_int = 0x10;
+pub const TCL_TRACE_WRITES: c_int = 0x20;
+pub const TCL_TRACE_UNSETS: c_int = 0x40;
+pub const TCL_TRACE_DESTROYED: c_int = 0x80;
+pub const TCL_INTERP_DESTROYED: c_int = 0x100;
+pub const TCL_TRACE_ARRAY: c_int = 0x800;
 
 unsafe extern "C" {
     pub fn Tcl_FindExecutable(argv0: *const c_char);
@@ -103,4 +124,59 @@ unsafe extern "C" {
         patch: *mut c_int,
         kind: *mut c_int,
     );
+    pub fn Tcl_SetResult(interp: *mut Tcl_Interp, result: *mut c_char, free: *mut c_void);
+    pub fn Tcl_PosixError(interp: *mut Tcl_Interp) -> *const c_char;
+
+    // Channels (tclIO.c).
+    pub fn Tcl_GetChannel(
+        interp: *mut Tcl_Interp,
+        name: *const c_char,
+        mode: *mut c_int,
+    ) -> Tcl_Channel;
+    pub fn Tcl_GetChannelName(chan: Tcl_Channel) -> *const c_char;
+    pub fn Tcl_IsChannelShared(chan: Tcl_Channel) -> c_int;
+    pub fn Tcl_RegisterChannel(interp: *mut Tcl_Interp, chan: Tcl_Channel);
+    pub fn Tcl_UnregisterChannel(interp: *mut Tcl_Interp, chan: Tcl_Channel) -> c_int;
+    pub fn Tcl_ClearChannelHandlers(chan: Tcl_Channel);
+    pub fn Tcl_CutChannel(chan: Tcl_Channel);
+    pub fn Tcl_SpliceChannel(chan: Tcl_Channel);
+    pub fn Tcl_Write(chan: Tcl_Channel, s: *const c_char, len: c_int) -> c_int;
+    pub fn Tcl_MakeTcpClientChannel(sock: ClientData) -> Tcl_Channel;
+    pub fn Tcl_GetChannelHandle(
+        chan: Tcl_Channel,
+        direction: c_int,
+        handle: *mut ClientData,
+    ) -> c_int;
+    pub fn Tcl_InputBuffered(chan: Tcl_Channel) -> c_int;
+    pub fn Tcl_SetChannelOption(
+        interp: *mut Tcl_Interp,
+        chan: Tcl_Channel,
+        name: *const c_char,
+        value: *const c_char,
+    ) -> c_int;
+
+    // Asynchronous handlers (tclAsync.c).
+    pub fn Tcl_AsyncCreate(proc_: Tcl_AsyncProc, cd: ClientData) -> Tcl_AsyncHandler;
+    pub fn Tcl_AsyncMark(async_: Tcl_AsyncHandler);
+    pub fn Tcl_AsyncInvoke(interp: *mut Tcl_Interp, code: c_int) -> c_int;
+    pub fn Tcl_AsyncDelete(async_: Tcl_AsyncHandler);
+    pub fn Tcl_AsyncReady() -> c_int;
+
+    // Variable traces (tclTrace.c).
+    pub fn Tcl_TraceVar2(
+        interp: *mut Tcl_Interp,
+        part1: *const c_char,
+        part2: *const c_char,
+        flags: c_int,
+        proc_: Tcl_VarTraceProc,
+        cd: ClientData,
+    ) -> c_int;
+    pub fn Tcl_VarTraceInfo2(
+        interp: *mut Tcl_Interp,
+        part1: *const c_char,
+        part2: *const c_char,
+        flags: c_int,
+        proc_: Tcl_VarTraceProc,
+        prev: ClientData,
+    ) -> ClientData;
 }

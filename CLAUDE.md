@@ -10,7 +10,8 @@ Guidance for working on aoloxide, a Rust port of AOLserver 4.5.
 | `crates/ns-script` | `Interp` / `ScriptEngine` trait, arg helpers | (new seam) |
 | `crates/ns-tcl` | Tcl 8.6 engine over libtcl FFI | `nsd/tclinit.c` (embedding) |
 | `crates/nsd` | server core: drivers, pools, conn pipeline, ADP, commands | `nsd/*.c` |
-| `crates/nslog`, `nsperm`, `nscgi`, `nsssl`, `nszlib`, `nscp`, `nsdb`, `nsproxy` | modules | `nslog/`, `nsperm/`, `nscgi/`, `nsssl/`, `nszlib/`, `nscp/`, `nsdb/`, `nsproxy/` |
+| `crates/nslog`, `nsperm`, `nscgi`, `nsssl`, `nszlib`, `nscp`, `nsdb`, `nsproxy`, `nsext` | modules | `nslog/`, `nsperm/`, `nscgi/`, `nsssl/`, `nszlib/`, `nscp/`, `nsdb/`, `nsproxy/`, `nsext/` |
+| `crates/nspd` | proxy-daemon library + `nssqlitepd` | `nspd/` |
 | `crates/aoloxide` | the `nsd` binary + module registry | `nsd/main.c`, `nsmain.c` |
 | `verus/` | Verus specs & proofs (run in CI) | |
 | `docs/adr/` | architecture decisions | |
@@ -62,5 +63,6 @@ in its `version.json`, then `verus verus/<file>.rs` (see `.github/workflows/ci.y
 3. Register it in `crates/aoloxide/src/lib.rs::modules()`.
 4. Ship any Tcl library as `TCL_LIBRARY` and install it in `install_home`.
 
-`nsproxy` workers are the separate `nsproxy` binary; tests that start
-workers need it built (`cargo test --workspace` does).
+`nsproxy` workers are the separate `nsproxy` binary, and the nsext tests
+start the `nssqlitepd` daemon; both must be built before those tests run
+(`cargo test --workspace` does).

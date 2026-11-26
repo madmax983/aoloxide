@@ -23,6 +23,7 @@ nszlib = { path = "../nszlib" }
 nscp = { path = "../nscp" }
 nsdb = { path = "../nsdb" }
 nsproxy = { path = "../nsproxy" }
+nsext = { path = "../nsext" }
 ns-tcl = { path = "../ns-tcl" }
 ns-script = { path = "../ns-script" }
 anyhow.workspace = true

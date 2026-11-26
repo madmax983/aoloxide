@@ -11,6 +11,8 @@ pub mod nsv;
 pub mod register;
 pub mod sched;
 pub mod set;
+pub mod share;
+pub mod sock;
 pub mod thread;
 
 use std::sync::{Arc, OnceLock};
@@ -42,6 +44,7 @@ pub fn core_commands() -> &'static [(&'static str, Command)] {
         v.extend(sched::commands());
         v.extend(thread::commands());
         v.extend(misc::commands());
+        v.extend(sock::commands());
         v.extend(file::commands());
         v.extend(adp::commands());
         v
