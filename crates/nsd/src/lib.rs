@@ -117,12 +117,17 @@ pub fn builtin_modules() -> ModuleRegistry {
 
 /// Initialise a plain-HTTP socket driver (the `nssock` module).
 pub fn nssock_init(ctx: &ModuleContext<'_>) -> Result<(), NsError> {
-    driver_init(ctx, false, Arc::new(PlainWrapper))
+    driver_init(ctx, "nssock", false, Arc::new(PlainWrapper))
 }
 
 /// Shared driver setup for `nssock` and TLS drivers (`Ns_DriverInit`).
+///
+/// `driver_name` is the driver's fixed name (`init->name`, e.g. `nssock`
+/// or `nsssl`, reported by `ns_conn driver`); the module instance name
+/// (`ctx.name`) is kept separately as the driver's module.
 pub fn driver_init(
     ctx: &ModuleContext<'_>,
+    driver_name: &str,
     ssl: bool,
     wrapper: Arc<dyn StreamWrapper>,
 ) -> Result<(), NsError> {
@@ -131,7 +136,7 @@ pub fn driver_init(
     let info = DriverInfo::from_config(
         c,
         &path,
-        ctx.name,
+        driver_name,
         ctx.name,
         ctx.server.map(|s| s.name.as_str()),
         ssl,

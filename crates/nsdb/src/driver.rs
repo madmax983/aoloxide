@@ -77,14 +77,31 @@ struct SqliteConn {
     rows: VecDeque<Vec<Option<String>>>,
 }
 
+/// A driver error.  Errors without a SQLite code use `NSDB`, as
+/// AOLserver's drivers do, so `ns_db` reports their message.
 fn sql_err(e: &rusqlite::Error) -> DbError {
     let code = match e {
         rusqlite::Error::SqliteFailure(f, _) => format!("{:?}", f.code),
-        _ => String::new(),
+        _ => "NSDB".to_owned(),
     };
     DbError {
         code,
         message: e.to_string(),
+    }
+}
+
+/// Whether `sql` holds only whitespace, comments and `;`.
+fn is_blank_sql(sql: &str) -> bool {
+    let mut s = sql;
+    loop {
+        s = s.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
+        if let Some(r) = s.strip_prefix("--") {
+            s = r.find('\n').map_or("", |i| &r[i..]);
+        } else if let Some(r) = s.strip_prefix("/*") {
+            s = r.find("*/").map_or("", |i| &r[i + 2..]);
+        } else {
+            return s.is_empty();
+        }
     }
 }
 
@@ -101,6 +118,11 @@ fn value_text(v: rusqlite::types::ValueRef<'_>) -> Option<String> {
 impl DbConnection for SqliteConn {
     fn exec(&mut self, sql: &str) -> Result<ExecResult, DbError> {
         self.rows.clear();
+        if is_blank_sql(sql) {
+            // SQLite compiles no statement from these; treat them as an
+            // empty DML command.
+            return Ok(ExecResult::Dml(0));
+        }
         let mut stmt = self.conn.prepare(sql).map_err(|e| sql_err(&e))?;
         let ncols = stmt.column_count();
         if ncols == 0 {
@@ -196,6 +218,19 @@ mod tests {
         let e = c.exec("select * from nosuch").expect_err("err");
         assert!(e.message.contains("no such table"));
         assert!(c.reset().is_ok() && c.connected());
+        // `ns_db interpretsqlfile` passes empty statements through.
+        assert_eq!(c.exec("").expect("empty"), ExecResult::Dml(0));
+        assert_eq!(c.exec(" \n ").expect("blank"), ExecResult::Dml(0));
+        assert_eq!(
+            c.exec("-- x\n/* y */ ;").expect("comments"),
+            ExecResult::Dml(0)
+        );
+        assert!(!is_blank_sql("/* a */ select 1") && !is_blank_sql("-- a\nselect 1"));
+        assert!(is_blank_sql("/* open") && is_blank_sql("-- open"));
+        assert_eq!(
+            c.exec("select * from nosuch").expect_err("err").code,
+            "Unknown"
+        );
         assert_eq!(DbError::msg("m").to_string(), "m");
     }
 }

@@ -14,7 +14,6 @@ ns-tcl = { path = "../ns-tcl" }
 thiserror.workspace = true
 tokio.workspace = true
 libc.workspace = true
-flate2.workspace = true
 encoding_rs.workspace = true
 
 [dev-dependencies]

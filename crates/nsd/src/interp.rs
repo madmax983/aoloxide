@@ -154,6 +154,31 @@ pub fn try_conn(interp: &dyn Interp) -> Option<ConnRef> {
     interp_conn(interp).ok()
 }
 
+/// Private `ns_set`s of an interp with no server (see [`init_bare`]).
+#[derive(Debug, Default)]
+pub struct BareSets {
+    /// Private sets.
+    pub sets: HashMap<String, SetRef>,
+    /// Next private set id.
+    pub next_set: u64,
+}
+
+/// Shared handle to [`BareSets`].
+pub type BareSetsRef = Rc<RefCell<BareSets>>;
+
+/// Prepare an interp created outside any virtual server, as
+/// `CreateInterp(NULL)` does for `Ns_TclCreateInterp` (used by `nsproxy`
+/// workers): add every core command (`NsTclAddCmds`).  As in AOLserver the
+/// server-independent commands (`ns_time`, `ns_fmttime`, private `ns_set`s,
+/// `ns_log` to stderr, ...) work; commands that need a server fail with
+/// "interp not associated with a server".
+pub fn init_bare(interp: &dyn Interp) {
+    interp.ext().insert::<BareSetsRef>(Rc::default());
+    for (name, cmd) in crate::cmds::core_commands() {
+        interp.register(name, Arc::clone(cmd));
+    }
+}
+
 thread_local! {
     static CACHE: RefCell<HashMap<String, Vec<Box<dyn Interp>>>> = RefCell::new(HashMap::new());
 }
@@ -424,5 +449,25 @@ mod tests {
         }
         assert_eq!(TraceWhen::parse("x"), None);
         assert!(format!("{:?}", TraceAction::Script("a".into())).contains('a'));
+    }
+
+    #[test]
+    fn bare_interp_has_server_independent_commands() {
+        use ns_script::ScriptEngine;
+        let i = ns_tcl::TclEngine::new().create_interp().expect("interp");
+        init_bare(&*i);
+        assert_eq!(
+            i.eval("string is integer -strict [ns_time]")
+                .expect("ns_time"),
+            "1"
+        );
+        let s = i.eval("ns_set create t a 1").expect("ns_set");
+        assert_eq!(i.eval(&format!("ns_set get {s} a")).expect("get"), "1");
+        assert_eq!(i.eval("ns_set list").expect("list"), s);
+        i.eval("ns_set cleanup").expect("cleanup");
+        assert_eq!(i.eval("ns_set list").expect("list"), "");
+        i.eval("ns_log notice bare").expect("ns_log to stderr");
+        let e = i.eval("ns_info server").expect_err("no server");
+        assert_eq!(e.message, "interp not associated with a server");
     }
 }

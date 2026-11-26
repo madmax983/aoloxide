@@ -159,14 +159,20 @@ fn init_and_reinit_scripts() {
     );
     assert!(code.starts_with("NSPROXY EExec"), "{code}");
     // A failed get returns its handles: the pool is not leaked.
-    let (_, code) = err(&*i, "ns_proxy get p5exec -handles 5");
+    // C reports the handles still wanted when it failed: none, once all
+    // were taken and a check failed.
+    let (m, code) = err(&*i, "ns_proxy get p5exec -handles 5");
+    assert_eq!(
+        m,
+        "could not get 5 handle from pool \"p5exec\": could not create child process"
+    );
     assert!(code.starts_with("NSPROXY EExec"), "{code}");
 }
 
 #[test]
 fn handle_limits() {
     let i = interp();
-    pool(&*i, "p6", "-max 2 -gettimeout 50");
+    pool(&*i, "p6", "-max 2 -getimeout 50");
     let (m, code) = err(&*i, "ns_proxy get p6 -handles 3");
     assert_eq!(
         m,
@@ -213,7 +219,8 @@ fn handle_limits() {
     );
     i.eval("ns_proxy cleanup").expect("cleanup");
     let (m, _) = err(&*i, "ns_proxy get p6 -handles -1");
-    assert_eq!(m, "invalid -handles: -1");
+    // As in C, the message names the pool, not the value.
+    assert_eq!(m, "invalid -handles: p6");
     assert_eq!(i.eval("ns_proxy get p6 -handles 0").expect("zero"), "");
 }
 
@@ -232,7 +239,7 @@ fn config_and_usage() {
             "-reinit",
             "-max",
             "-min",
-            "-gettimeout",
+            "-getimeout",
             "-evaltimeout",
             "-sendtimeout",
             "-recvtimeout",
@@ -246,6 +253,15 @@ fn config_and_usage() {
         "min clamped to max"
     );
     assert_eq!(items[11], "500");
+    let get = |opt: &str| {
+        let c = i
+            .eval(&format!("ns_proxy config p7 {opt}"))
+            .expect("config");
+        i.list_split(&c).expect("list")[11].clone()
+    };
+    assert_eq!(get("-getimeout 77"), "77");
+    assert_eq!(get("-get 78"), "78", "unique prefix");
+    assert_eq!(get("-gettimeout 79"), "79", "accepted alias");
     let (m, _) = err(&*i, "ns_proxy config p7 -max -1");
     assert_eq!(m, "invalid -max: -1");
     assert!(err(&*i, "ns_proxy config p7 -bogus 1")
@@ -303,4 +319,66 @@ fn allocation_deadlock_is_detected() {
         .join()
         .expect("thread")
         .expect("waiter got the released handle");
+}
+
+#[test]
+fn worker_stdio_is_not_the_protocol_channel() {
+    let i = interp();
+    pool(&*i, "p9", "");
+    i.eval("set h [ns_proxy get p9]").expect("get");
+    // stdout goes to stderr, stdin is /dev/null: neither touches the protocol.
+    assert_eq!(
+        i.eval("ns_proxy eval $h {puts hello; flush stdout; expr 7}")
+            .expect("puts"),
+        "7"
+    );
+    assert_eq!(
+        i.eval("ns_proxy eval $h {list [gets stdin] [eof stdin]}")
+            .expect("stdin"),
+        "{} 1"
+    );
+    assert_eq!(
+        i.eval("ns_proxy eval $h {expr 8}").expect("still in sync"),
+        "8"
+    );
+    i.eval("ns_proxy release $h").expect("release");
+}
+
+#[test]
+fn worker_interp_has_core_commands() {
+    let i = interp();
+    pool(&*i, "p10", "");
+    i.eval("set h [ns_proxy get p10]").expect("get");
+    assert_eq!(
+        i.eval("ns_proxy eval $h {string is integer -strict [ns_time]}")
+            .expect("ns_time"),
+        "1"
+    );
+    assert_eq!(
+        i.eval("ns_proxy eval $h {set s [ns_set create t a 1]; ns_set get $s a}")
+            .expect("ns_set"),
+        "1"
+    );
+    assert_eq!(
+        i.eval("ns_proxy eval $h {ns_log notice from-proxy}")
+            .expect("ns_log"),
+        ""
+    );
+    // Server commands fail cleanly: the worker has no virtual server.
+    let (m, _) = err(&*i, "ns_proxy eval $h {ns_set create -shared x}");
+    assert_eq!(m, "interp not associated with a server");
+    i.eval("ns_proxy release $h").expect("release");
+}
+
+#[test]
+fn failed_init_leaves_no_active_entry() {
+    let i = interp();
+    pool(&*i, "p11", "-init {after 1000} -evaltimeout 100");
+    let (m, code) = err(&*i, "ns_proxy get p11");
+    assert_eq!(
+        m,
+        "could not get 1 handle from pool \"p11\": init script failed"
+    );
+    assert!(code.starts_with("NSPROXY EInit"), "{code}");
+    assert_eq!(i.eval("ns_proxy active p11").expect("active"), "");
 }
