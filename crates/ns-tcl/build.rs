@@ -19,6 +19,9 @@ fn main() {
             "/usr/lib64",
             "/usr/lib",
             "/usr/local/lib",
+            // Homebrew: `tcl-tk` is Tcl 9; Tcl 8.6 is the `tcl-tk@8` keg.
+            "/opt/homebrew/opt/tcl-tk@8/lib",
+            "/usr/local/opt/tcl-tk@8/lib",
             "/opt/homebrew/opt/tcl-tk/lib",
             "/usr/local/opt/tcl-tk/lib",
         ] {

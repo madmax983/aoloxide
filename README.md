@@ -12,7 +12,7 @@ caches and modules.
 
 ```console
 $ cargo build --release
-$ ./target/release/nsd --install-home /srv/aolserver
+$ ./target/release/nsd --install-home examples/home   # where examples/nsconfig.tcl expects it
 $ ./target/release/nsd -f -t examples/nsconfig.tcl
 ```
 
@@ -73,11 +73,13 @@ Design decisions are recorded in [docs/adr](docs/adr).
 ## Building
 
 Requirements: Rust 1.85+, and Tcl 8.6 development files (`tcl8.6-dev` on
-Debian/Ubuntu, `tcl-tk` on Homebrew).  Override the library location with
-`TCL_LIB_DIR` / `TCL_LIB_NAME`.
+Debian/Ubuntu, `tcl-tk@8` on Homebrew; Homebrew's plain `tcl-tk` is Tcl 9
+and will not link).  Override the library location with `TCL_LIB_DIR` /
+`TCL_LIB_NAME`.
 
 ```console
-$ sudo apt-get install tcl8.6-dev
+$ sudo apt-get install tcl8.6-dev      # Debian/Ubuntu
+$ brew install tcl-tk@8                # macOS
 $ cargo test --workspace
 ```
 

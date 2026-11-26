@@ -23,7 +23,7 @@ https://github.com/aolserver/aolserver when porting more of it.
 ## Commands
 
 ```sh
-sudo apt-get install tcl8.6-dev      # required to link ns-tcl
+sudo apt-get install tcl8.6-dev      # required to link ns-tcl (macOS: brew install tcl-tk@8)
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
