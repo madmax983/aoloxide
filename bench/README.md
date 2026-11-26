@@ -66,7 +66,8 @@ fails unless the bodies hash identically to aoloxide's.
   divided by requests served: the cost of a request independent of how
   many cores were available.
 * **ctxsw/req** is the change in the server's voluntary + involuntary context
-  switches (summed over `/proc/<pid>/task/*/status`) divided by requests.
+  switches, per thread from `/proc/<pid>/task/*/status`, divided by requests.
+  Threads that exit during a run are not counted (a slight undercount).
 * **Peak RSS** is the server's `VmHWM` after all its runs.
 * Raw wrk output and server logs go to `bench/results/raw/` (git-ignored).
 

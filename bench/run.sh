@@ -97,7 +97,16 @@ end
 EOF
 
 cpu_ticks() { awk '{print $14 + $15}' "/proc/$1/stat"; }   # utime + stime
-ctx_switches() { cat /proc/"$1"/task/*/status 2>/dev/null | awk '/ctxt_switches/ {s += $2} END {print s + 0}'; }
+# Per-thread "tid switches" snapshot; ctx_delta sums each live thread's
+# change (a thread that exits mid-run drops out instead of going negative).
+ctx_snapshot() {
+  local f tid
+  for f in /proc/"$1"/task/*/status; do
+    tid=${f%/status}; tid=${tid##*/}
+    awk -v t="$tid" '/ctxt_switches/ {s += $2} END {print t, s + 0}' "$f" 2>/dev/null || true
+  done
+}
+ctx_delta() { awk 'NR == FNR {a[$1] = $2; next} {d += $2 - (($1 in a) ? a[$1] : 0)} END {print d + 0}' "$1" "$2"; }
 hwm_kb() { awk '/VmHWM/ {print $2}' "/proc/$1/status"; }
 
 # start <server>: sets SERVER_PID and PORT.
@@ -170,17 +179,18 @@ run_server() {
       local t=$WRK_THREADS; [ "$c" -lt "$t" ] && t=$c
       taskset -c "$CLIENT_CPUS" wrk -t"$t" -c"$c" -d"${WARMUP}s" "${KEEP[@]}" \
         "http://127.0.0.1:$PORT$path" >/dev/null
-      local cpu0 cpu1 sw0 sw1 line
-      cpu0=$(cpu_ticks "$SERVER_PID"); sw0=$(ctx_switches "$SERVER_PID")
+      local cpu0 cpu1 line
+      cpu0=$(cpu_ticks "$SERVER_PID"); ctx_snapshot "$SERVER_PID" > "$WORK/ctx0"
       line=$(taskset -c "$CLIENT_CPUS" wrk -t"$t" -c"$c" -d"${DURATION}s" --latency "${KEEP[@]}" \
                -s "$WORK/report.lua" "http://127.0.0.1:$PORT$path" \
              | tee "$BENCH/results/raw/$server-$name-c$c.txt" | grep '^RESULT,')
-      cpu1=$(cpu_ticks "$SERVER_PID"); sw1=$(ctx_switches "$SERVER_PID")
+      cpu1=$(cpu_ticks "$SERVER_PID"); ctx_snapshot "$SERVER_PID" > "$WORK/ctx1"
       IFS=, read -r _ rps p50 p90 p99 max errs non2xx <<< "$line"
       local cpu sw
       cpu=$(awk -v d=$((cpu1 - cpu0)) -v hz="$HZ" -v r="$rps" -v t="$DURATION" \
               'BEGIN { printf "%.1f", (d / hz) * 1e6 / (r * t) }')
-      sw=$(awk -v d=$((sw1 - sw0)) -v r="$rps" -v t="$DURATION" 'BEGIN { printf "%.2f", d / (r * t) }')
+      sw=$(awk -v d="$(ctx_delta "$WORK/ctx0" "$WORK/ctx1")" -v r="$rps" -v t="$DURATION" \
+             'BEGIN { printf "%.2f", d / (r * t) }')
       echo "$server,$name,$c,$rps,$p50,$p90,$p99,$max,$errs,$non2xx,$cpu,$sw" >> "$CSV"
       printf "   %-11s %-11s c=%-4s %10s req/s  p50 %6sus  p99 %7sus  cpu %5sus/req  ctxsw %4s/req  err %s/%s\n" \
         "$server" "$name" "$c" "$rps" "$p50" "$p99" "$cpu" "$sw" "$errs" "$non2xx"
