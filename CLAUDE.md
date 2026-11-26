@@ -64,5 +64,5 @@ in its `version.json`, then `verus verus/<file>.rs` (see `.github/workflows/ci.y
 4. Ship any Tcl library as `TCL_LIBRARY` and install it in `install_home`.
 
 `nsproxy` workers are the separate `nsproxy` binary, and the nsext tests
-start the `nssqlitepd` daemon; tests that need them need them built
+start the `nssqlitepd` daemon; both must be built before those tests run
 (`cargo test --workspace` does).
