@@ -88,8 +88,10 @@ CI with [Verus](https://github.com/verus-lang/verus).
 
 ## Performance
 
-[`bench/`](bench) compares aoloxide with an equivalent axum server under wrk;
-results and a profile of where aoloxide's time goes are in
+[`bench/`](bench) compares aoloxide with the original C AOLserver 4.5 and an
+equivalent axum server under wrk.  aoloxide performs like the C original
+(faster on Tcl procs and static files, ~20% more CPU on ADP pages); results
+and a profile of where the time goes are in
 [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Running
